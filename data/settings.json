@@ -1,0 +1,8 @@
+{
+  "api_id": 2040,
+  "api_hash": "b18441a1ff607e10a989891a5462e627",
+  "default_delay_min": 45,
+  "default_delay_max": 60,
+  "max_per_account": 50,
+  "flood_wait_cap": 120
+}

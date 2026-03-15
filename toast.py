@@ -14,6 +14,7 @@ TOAST_HEIGHT = 60  # Fallback height before layout settles
 TOAST_SPACING = 10
 MARGIN_RIGHT = 20
 MARGIN_BOTTOM = 20
+TOAST_OFFSET_Y = 50  # Offset from top to avoid overlap with header
 
 
 class Toast(QWidget):
@@ -42,9 +43,15 @@ class Toast(QWidget):
         self._apply_styles()
 
         self._close_timer = QTimer(self)
-        self._close_timer.setSingleShot(True)          # FIX: was not single-shot
+        self._close_timer.setSingleShot(True)
         self._close_timer.timeout.connect(self.hide_toast)
         self._close_timer.start(duration)
+        
+        # Failsafe: force hide after duration + 1 second in case animation fails
+        self._failsafe_timer = QTimer(self)
+        self._failsafe_timer.setSingleShot(True)
+        self._failsafe_timer.timeout.connect(self._force_hide)
+        self._failsafe_timer.start(duration + 1000)
 
     # ------------------------------------------------------------------
     # Setup
@@ -177,9 +184,30 @@ class Toast(QWidget):
         self._slide_out_anim.start()
 
     def _on_hidden(self):
-        self.hide()
-        self.closed.emit()   # notify manager before deletion
-        self.deleteLater()
+        try:
+            self.hide()
+            self.setParent(None)
+            self.closed.emit()
+        except Exception:
+            pass
+        finally:
+            self.deleteLater()
+
+    def _force_hide(self):
+        """Force hide toast immediately without animation - failsafe."""
+        try:
+            self._close_timer.stop()
+            if self._slide_in_anim and self._slide_in_anim.state() == QPropertyAnimation.State.Running:
+                self._slide_in_anim.stop()
+            if self._slide_out_anim and self._slide_out_anim.state() == QPropertyAnimation.State.Running:
+                self._slide_out_anim.stop()
+            self.hide()
+            self.setParent(None)
+            self.closed.emit()
+        except Exception:
+            pass
+        finally:
+            self.deleteLater()
 
 
 # ---------------------------------------------------------------------------
@@ -223,11 +251,16 @@ class ToastManager(QObject):
         # Evict oldest if at capacity.
         if len(self._toasts) >= self._max_toasts:
             evicted = self._toasts.pop(0)
-            evicted.closed.disconnect()   # avoid double-remove
+            try:
+                evicted.closed.disconnect(self._on_toast_closed)
+            except:
+                pass
             evicted.hide_toast()
 
         toast = Toast(message, toast_type, self._parent_widget, duration)
-        toast.closed.connect(lambda t=toast: self._on_toast_closed(t))
+        # FIX: Use partial instead of lambda to avoid closure issues
+        from functools import partial
+        toast.closed.connect(partial(self._on_toast_closed, toast))
         self._toasts.append(toast)
 
         # Show new toast at its target slot (bottom of stack).
@@ -243,10 +276,20 @@ class ToastManager(QObject):
     def info(self, message: str):    self.show_toast(message, "info")
 
     def clear_all(self):
+        """Immediately hide and destroy all toasts."""
         for t in list(self._toasts):
-            t.closed.disconnect()
-            t.hide_toast()
+            try:
+                t.closed.disconnect()
+            except:
+                pass
+            t.hide()
+            t.setParent(None)
+            t.deleteLater()
         self._toasts.clear()
+
+    def clear_stuck_toasts(self):
+        """Force cleanup any potentially stuck toasts."""
+        self.clear_all()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -255,26 +298,24 @@ class ToastManager(QObject):
     def _slot_position(self, index: int) -> tuple[int, int]:
         """
         Return (x, y) in parent coordinates for the toast at list *index*.
-
-        Convention: newest toast (last in list) sits at the bottom;
-        older ones stack upward.
-          slot 0  → bottom (newest)
-          slot n  → top    (oldest)
+        Toasts stack from top-right (newest at top).
         """
         pw = self._parent_widget
         count = len(self._toasts)
-        slot = count - 1 - index          # 0 = bottom-most
+        # Stack from top: newest at index count-1 goes at top
+        slot = index  # 0 = top-most (oldest), count-1 = bottom (newest)
 
         toast = self._toasts[index]
         h = toast.height() if toast.height() > 0 else TOAST_HEIGHT
         w = toast.width()  if toast.width()  > 0 else TOAST_WIDTH
 
-        x = pw.width()  - MARGIN_RIGHT  - w
-        y = pw.height() - MARGIN_BOTTOM - (slot + 1) * h - slot * TOAST_SPACING
+        x = pw.width() - MARGIN_RIGHT - w
+        # Position from top with offset, stacking downward
+        y = TOAST_OFFSET_Y + slot * (h + TOAST_SPACING)
 
-        # Keep inside parent bounds.
+        # Keep inside parent bounds
         x = max(0, x)
-        y = max(0, y)
+        y = max(TOAST_OFFSET_Y, y)
         return x, y
 
     def _reposition_all(self, skip_index: int = -1):
@@ -283,12 +324,19 @@ class ToastManager(QObject):
             if i == skip_index:
                 continue
             x, y = self._slot_position(i)
-            toast.move_to(x, y)
+            try:
+                toast.move_to(x, y)
+            except Exception:
+                pass
 
     def _on_toast_closed(self, toast: Toast):
-        if toast in self._toasts:
-            self._toasts.remove(toast)
-            self._reposition_all()
+        """Called when a toast is closed."""
+        try:
+            if toast in self._toasts:
+                self._toasts.remove(toast)
+                self._reposition_all()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

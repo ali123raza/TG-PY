@@ -272,6 +272,68 @@ class DataService(QObject):
             return False
 
 
+    # ── Peers ─────────────────────────────────────────────────────────────────
+
+    def get_peers(self) -> list:
+        return run_async(service_manager.get_peers())
+
+    def get_peer(self, peer_id: int) -> Optional[dict]:
+        return run_async(service_manager.get_peer(peer_id))
+
+    def create_peer(self, data: dict) -> dict:
+        return run_async(service_manager.create_peer(data))
+
+    def update_peer(self, peer_id: int, data: dict) -> dict:
+        return run_async(service_manager.update_peer(peer_id, data))
+
+    def delete_peer(self, peer_id: int) -> bool:
+        return run_async(service_manager.delete_peer(peer_id))
+
+    # ── Contacts ──────────────────────────────────────────────────────────────
+
+    def get_contacts(self, peer_id: int, status: Optional[str] = None,
+                     search: Optional[str] = None,
+                     limit: int = 500, offset: int = 0) -> list:
+        return run_async(service_manager.get_contacts(
+            peer_id, status, search, limit, offset))
+
+    def get_peer_contact_count(self, peer_id: int) -> dict:
+        return run_async(service_manager.get_peer_contact_count(peer_id))
+
+    def bulk_import_contacts(self, peer_id: int, raw_text: str,
+                              fmt: str = "auto") -> dict:
+        return run_async(service_manager.bulk_import_contacts(
+            peer_id, raw_text, fmt), timeout=300)
+
+    def delete_contact(self, contact_id: int) -> bool:
+        return run_async(service_manager.delete_contact(contact_id))
+
+    def clear_peer_contacts(self, peer_id: int,
+                             status_filter: Optional[str] = None) -> int:
+        return run_async(service_manager.clear_peer_contacts(
+            peer_id, status_filter))
+
+    def export_peer_contacts(self, peer_id: int, fmt: str = "txt") -> str:
+        return run_async(service_manager.export_peer_contacts(peer_id, fmt))
+
+    def get_peer_targets(self, peer_id: int) -> list:
+        return run_async(service_manager.get_peer_targets(peer_id))
+
+    # ── Template categories ───────────────────────────────────────────────────
+
+    def get_template_categories(self) -> list:
+        return run_async(service_manager.get_template_categories())
+
+    def create_template_category(self, name: str, color: str = "#3FB950") -> dict:
+        return run_async(service_manager.create_template_category(name, color))
+
+    def delete_template_category(self, cat_id: int) -> bool:
+        return run_async(service_manager.delete_template_category(cat_id))
+
+    def preview_template(self, template_id: int, sample_vars: dict = None) -> str:
+        return run_async(service_manager.preview_template(
+            template_id, sample_vars or {}))
+
 # ── Singleton ─────────────────────────────────────────────────────────────────
 
 _data_service: Optional[DataService] = None

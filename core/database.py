@@ -3,7 +3,6 @@ from sqlalchemy.orm import DeclarativeBase
 
 from core.config import DATABASE_URL
 
-# SQLite specific settings to avoid database locked issues
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,
@@ -17,21 +16,39 @@ class Base(DeclarativeBase):
 
 
 async def init_db():
-    from core.models import Account, Proxy, Campaign, MessageTemplate, FailedMessage, Log
+    from core.models import (Account, Proxy, Campaign, MessageTemplate,
+                              TemplateVariant, TemplateCategory,
+                              Peer, Contact, FailedMessage, Log)
     from sqlalchemy import text
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Enable WAL mode for better concurrency
+
+        # SQLite performance
         await conn.execute(text("PRAGMA journal_mode=WAL"))
         await conn.execute(text("PRAGMA busy_timeout=60000"))
         await conn.execute(text("PRAGMA synchronous=NORMAL"))
-        # Migrate: add media columns to existing tables
-        for table in ["message_templates", "campaigns"]:
-            for col, typ in [("media_path", "VARCHAR(500)"), ("media_type", "VARCHAR(20)")]:
-                try:
-                    await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {typ} DEFAULT ''"))
-                except Exception:
-                    pass
+
+        # ── Migrations for existing installations ────────────────────────────
+        migrations = [
+            # message_templates upgrades
+            ("message_templates", "media_path",      "VARCHAR(500) DEFAULT ''"),
+            ("message_templates", "media_type",      "VARCHAR(20)  DEFAULT ''"),
+            ("message_templates", "category_id",     "INTEGER      REFERENCES template_categories(id)"),
+            ("message_templates", "use_variants",    "BOOLEAN      DEFAULT 0"),
+            ("message_templates", "variables_used",  "TEXT         DEFAULT '[]'"),
+            # campaigns upgrades
+            ("campaigns",         "media_path",      "VARCHAR(500) DEFAULT ''"),
+            ("campaigns",         "media_type",      "VARCHAR(20)  DEFAULT ''"),
+            ("campaigns",         "peer_ids",        "TEXT         DEFAULT '[]'"),
+            ("campaigns",         "rotate_proxies",  "BOOLEAN      DEFAULT 0"),
+        ]
+        for table, col, typ in migrations:
+            try:
+                await conn.execute(
+                    text(f"ALTER TABLE {table} ADD COLUMN {col} {typ}"))
+            except Exception:
+                pass   # column already exists — fine
 
 
 async def get_db():

@@ -18,7 +18,9 @@ from sqlalchemy.orm import selectinload
 
 from core.config import SESSIONS_DIR, BASE_DIR, MEDIA_DIR, TGDATA_DIR
 from core.database import async_session, init_db
-from core.models import Account, Proxy, Campaign, MessageTemplate, Log, FailedMessage
+from core.models import (Account, Proxy, Campaign, MessageTemplate,
+                         TemplateVariant, TemplateCategory,
+                         Peer, Contact, Log, FailedMessage)
 from services.telegram import client_manager
 from services.tdata_import import import_tdata_accounts as _import_tdata_accounts
 
@@ -30,6 +32,7 @@ _import_jobs:  dict[str, dict] = {}
 _send_jobs:    dict[str, dict] = {}   # messaging jobs
 _scrape_jobs:  dict[str, dict] = {}
 _join_jobs:    dict[str, dict] = {}
+_import_contact_jobs: dict[str, dict] = {}
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -39,6 +42,19 @@ def _new_job(store: dict, **extra) -> str:
     store[job_id] = {"status": "starting", "sent": 0, "failed": 0,
                      "total": 0, "progress": 0, "message": "", **extra}
     return job_id
+
+
+import random as _random
+import json as _json
+
+def _pick_template_text(template: "MessageTemplate", custom: str) -> str:
+    """Pick text from template — uses random variant if use_variants=True."""
+    if template is None:
+        return custom
+    if template.use_variants and template.variants:
+        variant = _random.choice(template.variants)
+        return variant.text
+    return template.text or custom
 
 
 def _resolve_message(template: Optional[str], custom: str, variables: dict, target: str) -> str:
@@ -59,6 +75,22 @@ class ServiceManager:
 
     async def init(self):
         await init_db()
+
+
+    @staticmethod
+    def _safe_json(value, default=None):
+        """Safe json.loads — handles None, empty string, already-list."""
+        if default is None:
+            default = []
+        if not value:
+            return default
+        if isinstance(value, list):
+            return value
+        try:
+            import json as _json
+            return _json.loads(value)
+        except Exception:
+            return default
 
     def add_listener(self, cb: callable):
         self._listeners.append(cb)
@@ -359,6 +391,25 @@ class ServiceManager:
                 return None
         return None
 
+    async def get_working_proxy(self) -> Optional[Proxy]:
+        """Find and return first working proxy from backend, or None if none work."""
+        async with async_session() as db:
+            result = await db.execute(
+                select(Proxy).where(Proxy.is_active == True).order_by(Proxy.created_at.desc()))
+            proxies = result.scalars().all()
+
+        for proxy in proxies:
+            try:
+                import asyncio
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(proxy.host, proxy.port), timeout=5)
+                writer.close()
+                await writer.wait_closed()
+                return proxy  # Return first working proxy
+            except Exception:
+                continue  # Try next proxy
+        return None  # No working proxy found
+
     async def test_proxy(self, proxy_id: int) -> dict:
         """Try opening a TCP connection to the proxy."""
         import asyncio
@@ -397,16 +448,20 @@ class ServiceManager:
         Start a bulk send job.  Returns {"job_id": ..., "status": "starting"}.
 
         data keys:
-            account_ids   list[int]
-            targets       list[str]   usernames / phone numbers
-            message       str         plain text (used when no template)
-            template_id   int | None
-            delay_min     int         seconds
-            delay_max     int         seconds
-            mode          str         "sequential" | "round_robin"
-            max_per_account int       0 = unlimited
-            rotate_proxies  bool
-            campaign_id   int | None
+            account_ids     list[int]
+            targets         list[str]   usernames / phone numbers
+            message         str         plain text (used when no template)
+            template_id     int | None
+            delay_min       int         seconds
+            delay_max       int         seconds
+            mode            str         "sequential" | "round_robin"
+            max_per_account int         0 = unlimited
+            rotate_proxies  bool        only rotates on FloodWait, never overrides
+                                        account's assigned proxy on normal errors
+            campaign_id     int | None
+
+        NOTE: Each account always uses its own assigned proxy.
+              rotate_proxies only switches account when FloodWait occurs.
         """
         job_id = _new_job(_send_jobs, campaign_id=data.get("campaign_id"))
         _send_jobs[job_id]["total"] = len(data.get("targets", []))
@@ -421,22 +476,35 @@ class ServiceManager:
         return False
 
     async def _do_send(self, job_id: str, data: dict):
-        """Background send task — mirrors routers/messaging_telethon.py _send_bulk."""
+        """
+        Background bulk send task.
+
+        Proxy policy (FIXED):
+        ─────────────────────
+        Each account ALWAYS uses its own assigned proxy (acc.proxy).
+        We NEVER randomly swap an account's proxy from a global pool.
+
+        The only exception is FloodWait with no available alternative account:
+        in that case we wait and retry with the SAME account+proxy, or switch
+        to a different account (with that account's own proxy).
+
+        rotate_proxies flag is intentionally ignored for per-send rotation —
+        it is kept in the API signature for compatibility only.
+        """
         job = _send_jobs[job_id]
 
-        account_ids    = data.get("account_ids", [])
-        targets        = data.get("targets", [])
-        message        = data.get("message", "")
-        template_id    = data.get("template_id")
-        delay_min      = data.get("delay_min", 5)
-        delay_max      = data.get("delay_max", 15)
-        mode           = data.get("mode", "sequential")
-        max_per_acct   = data.get("max_per_account", 0)
-        rotate_proxies = data.get("rotate_proxies", True)
-        campaign_id    = data.get("campaign_id")
+        account_ids  = data.get("account_ids", [])
+        targets      = data.get("targets", [])
+        message      = data.get("message", "")
+        template_id  = data.get("template_id")
+        delay_min    = data.get("delay_min", 5)
+        delay_max    = data.get("delay_max", 15)
+        mode         = data.get("mode", "sequential")
+        max_per_acct = data.get("max_per_account", 0)
+        campaign_id  = data.get("campaign_id")
 
         try:
-            # Resolve template text
+            # ── Resolve template ──────────────────────────────────────────────
             template_text: Optional[str] = None
             if template_id:
                 async with async_session() as db:
@@ -449,8 +517,8 @@ class ServiceManager:
                 job["message"] = "No message or template provided"
                 return
 
+            # ── Load accounts with their OWN proxies ──────────────────────────
             async with async_session() as db:
-                # Load active accounts with proxies
                 result = await db.execute(
                     select(Account)
                     .options(selectinload(Account.proxy))
@@ -458,57 +526,191 @@ class ServiceManager:
                 )
                 accounts = list(result.scalars().all())
 
-                if not accounts:
-                    job["status"] = "failed"
-                    job["message"] = "No active accounts found"
-                    return
+            if not accounts:
+                job["status"] = "failed"
+                job["message"] = "No active accounts found"
+                return
 
-                # Load proxy pool for rotation
-                all_proxies: list[Proxy] = []
-                if rotate_proxies:
-                    pr = await db.execute(select(Proxy).where(Proxy.is_active == True))
-                    all_proxies = list(pr.scalars().all())
+            # ── Auto-assign working proxy to accounts without proxy ───────────
+            working_proxy = None
+            for acc in accounts:
+                if not acc.proxy_id:
+                    if working_proxy is None:
+                        working_proxy = await self.get_working_proxy()
+                        if working_proxy:
+                            async with async_session() as db:
+                                acc.proxy_id = working_proxy.id
+                                await db.commit()
+                                logger.info("Auto-assigned proxy %s:%s to account %s",
+                                            working_proxy.host, working_proxy.port, acc.phone)
 
-            proxy_pool_idx = 0
-
-            # Connect clients
+            # ── Connect every account using its OWN assigned proxy ────────────
+            # Each entry: (Account, TelegramClient, assigned_proxy)
+            # The proxy here is FIXED for this account — we never change it.
             clients: list[tuple[Account, Any, Optional[Proxy]]] = []
             for acc in accounts:
+                assigned_proxy = acc.proxy   # the proxy assigned in edit_account (or auto-assigned above)
+                proxy_label = f"{assigned_proxy.host}:{assigned_proxy.port}" if assigned_proxy else "direct"
                 try:
-                    client = await client_manager.get_client(acc.id, acc.phone, acc.proxy)
-                    clients.append((acc, client, acc.proxy))
+                    client = await client_manager.get_client(
+                        acc.id, acc.phone, assigned_proxy)
+                    clients.append((acc, client, assigned_proxy))
                     async with async_session() as db:
                         db.add(Log(level="info", category="message", account_id=acc.id,
-                                   message=f"Connected for send job {job_id}"))
+                                   message=f"Connected via {proxy_label}"))
                         await db.commit()
                 except Exception as e:
-                    logger.error("Failed to connect account %s: %s", acc.id, e)
+                    logger.error("Account %s failed to connect via %s: %s",
+                                 acc.phone, proxy_label, e)
                     async with async_session() as db:
                         db.add(Log(level="error", category="message", account_id=acc.id,
-                                   message=f"Failed to connect: {e}"))
+                                   message=f"Cannot connect via {proxy_label}: {e}"))
                         await db.commit()
 
             if not clients:
                 job["status"] = "failed"
-                job["message"] = "Could not connect any account"
+                job["message"] = "Could not connect any account. Check: 1) Session valid? 2) Proxy working?"
+                logger.error("Send job %s: No clients could connect. Accounts: %s", job_id, account_ids)
+                async with async_session() as db:
+                    db.add(Log(level="error", category="message",
+                               message=f"Send job {job_id}: no accounts could connect"))
+                    await db.commit()
                 return
 
             job["status"] = "running"
-            job["total"] = len(targets)
+
+            # ── BULK phone resolution before sending ──────────────────────────
+            # Separate targets into phones and non-phones
+            phone_targets   = [t for t in targets
+                               if t.startswith("+") or
+                               (t.lstrip("+").isdigit() and len(t) > 7)]
+            direct_targets  = [t for t in targets if t not in phone_targets]
+
+            # _resolved_map: original_target → resolved_entity (user_id or username)
+            # None means "not on Telegram — skip"
+            _resolved_map: dict[str, object] = {t: t for t in direct_targets}
+
+            if phone_targets and clients:
+                # Use first available client for bulk import
+                bulk_acc, bulk_client, _ = clients[0]
+                job["message"] = f"Resolving {len(phone_targets)} phone number(s)…"
+
+                try:
+                    from pyrogram.types import InputPhoneContact as _IPC
+                    # Build contacts list — all phones in ONE API call
+                    contacts = [
+                        _IPC(
+                            phone=p if p.startswith("+") else f"+{p}",
+                            first_name="User",
+                            last_name="",
+                        )
+                        for p in phone_targets
+                    ]
+                    
+                    # DEBUG: Log what we're trying to import
+                    logger.info("DEBUG: Importing %d contacts: %s", len(contacts), 
+                               [c.phone for c in contacts])
+                    
+                    result = await bulk_client.import_contacts(contacts)
+
+                    # DEBUG: Log what we got back
+                    logger.info("DEBUG: import_contacts returned %d users", len(result.users))
+                    
+                    # Map imported_client_id → user_id
+                    # Pyrogram returns result.users with matching order
+                    # FIX: Safely get phone_number attribute - not all User objects have it
+                    imported_ids = {}
+                    for u in result.users:
+                        try:
+                            phone = getattr(u, 'phone_number', None)
+                            uid = getattr(u, 'id', None)
+                            logger.info("DEBUG: User returned - phone: %s, id: %s", phone, uid)
+                            if phone:
+                                imported_ids[phone] = uid
+                        except Exception:
+                            pass  # Skip users without phone_number
+
+                    # DEBUG: Log what we mapped
+                    logger.info("DEBUG: imported_ids map: %s", imported_ids)
+
+                    for p in phone_targets:
+                        phone_e164 = p if p.startswith("+") else f"+{p}"
+                        # Try with + and without
+                        uid = imported_ids.get(phone_e164) or imported_ids.get(p)
+                        if uid:
+                            _resolved_map[p] = uid
+                            logger.debug("Resolved %s → %s", p, uid)
+                        else:
+                            # FALLBACK: If import_contacts returned users but no match,
+                            # the phone might still be valid. Try direct send.
+                            if len(result.users) > 0:
+                                # Some users returned but not our target - might be privacy setting
+                                # Fallback to trying the phone number directly
+                                _resolved_map[p] = phone_e164  # Use phone as-is for direct send
+                                logger.warning("Phone %s not in import results, trying direct send", p)
+                            else:
+                                # Truly not found
+                                _resolved_map[p] = None   # not on Telegram
+                                job["failed"] += 1
+                                async with async_session() as db:
+                                    db.add(Log(level="warn", category="message",
+                                               account_id=bulk_acc.id,
+                                               message=f"Phone {p} not on Telegram — skipped"))
+                                    await db.commit()
+
+                    resolved_count = sum(1 for v in _resolved_map.values() if v is not None)
+                    not_found = len(phone_targets) - resolved_count
+                    job["message"] = (
+                        f"Resolved {resolved_count}/{len(phone_targets)} phones"
+                        + (f", {not_found} not on Telegram" if not_found else "")
+                    )
+                    logger.info("Bulk resolved %d/%d phones", resolved_count, len(phone_targets))
+
+                except ImportError:
+                    # Telethon — phones passed directly, it resolves internally
+                    for p in phone_targets:
+                        _resolved_map[p] = p if p.startswith("+") else f"+{p}"
+                    logger.info("Telethon mode — phones passed directly")
+
+                except Exception as bulk_err:
+                    # Bulk import failed — fall back to direct phone passing
+                    logger.warning("Bulk contact import failed: %s — using phones directly", bulk_err)
+                    for p in phone_targets:
+                        _resolved_map[p] = p if p.startswith("+") else f"+{p}"
+
+            # Effective targets = those that resolved successfully
+            effective_targets = [t for t in targets if _resolved_map.get(t) is not None]
+            job["total"] = len(effective_targets)
+            # Pre-count phones not found as failed
+            phones_not_found = [t for t in phone_targets if _resolved_map.get(t) is None]
+            job["failed"] = len(phones_not_found)
+            if phones_not_found:
+                async with async_session() as db:
+                    for p in phones_not_found:
+                        db.add(FailedMessage(
+                            campaign_id=campaign_id,
+                            target=p,
+                            message_text="",
+                            error="Phone not registered on Telegram",
+                        ))
+                    await db.commit()
 
             account_counts: dict[int, int] = {acc.id: 0 for acc, _, _ in clients}
             blocked_until:  dict[int, float] = {}
             failed_targets: list[dict] = []
 
-            for i, target in enumerate(targets):
+            for i, target in enumerate(effective_targets):
                 if job.get("cancelled"):
                     job["status"] = "cancelled"
                     break
 
-                # Pick account
+                # ── Pick account (round-robin / sequential) ───────────────────
                 acc = client = cur_proxy = None
                 for attempt in range(len(clients)):
-                    idx = ((i + attempt) % len(clients)) if mode == "round_robin" else (attempt % len(clients))
+                    if mode == "round_robin":
+                        idx = (i + attempt) % len(clients)
+                    else:
+                        idx = attempt % len(clients)
                     c_acc, c_client, c_proxy = clients[idx]
                     if max_per_acct > 0 and account_counts[c_acc.id] >= max_per_acct:
                         continue
@@ -520,91 +722,115 @@ class ServiceManager:
 
                 if not acc:
                     job["failed"] += 1
-                    failed_targets.append({"target": target, "error": "All accounts at limit or blocked"})
+                    failed_targets.append({"target": target,
+                                           "error": "All accounts at limit or flood-blocked"})
                     continue
 
                 text = _resolve_message(template_text, message, {}, target)
                 sent_ok = False
 
+                # resolved_target set by bulk resolution above
+                resolved_target = _resolved_map.get(target, target)
+                if resolved_target is None:
+                    # Phone not on Telegram — already counted in failed
+                    continue
+
                 for retry in range(3):
                     try:
-                        await client.send_message(target, text)
+                        # Reconnect if needed
+                        if hasattr(client, 'is_connected') and not client.is_connected:
+                            client = await client_manager.get_client(acc.id, acc.phone, cur_proxy)
+                        elif callable(getattr(client, 'is_connected', None)) and not client.is_connected():
+                            client = await client_manager.get_client(acc.id, acc.phone, cur_proxy)
+                        await client.send_message(resolved_target, text)
                         sent_ok = True
+                        # NOTE: media sending (send_photo/video/audio) goes here
+                        # when media_path is provided — handled by campaign runner
                         job["sent"] += 1
                         account_counts[acc.id] += 1
                         async with async_session() as db:
                             acc_row = await db.get(Account, acc.id)
                             if acc_row:
                                 acc_row.messages_sent = (acc_row.messages_sent or 0) + 1
+                            proxy_label = f"{cur_proxy.host}:{cur_proxy.port}" if cur_proxy else "direct"
                             db.add(Log(level="info", category="message", account_id=acc.id,
-                                       message=f"Sent to {target}"))
+                                       message=f"Sent to {target} via {proxy_label}"))
                             await db.commit()
                         break
 
                     except Exception as e:
-                        err = str(e).lower()
-                        if "flood" in err:
-                            # Parse wait seconds from error message if possible
-                            wait = 60
+                        err_lower = str(e).lower()
+
+                        # ── FloodWait: block this account, try another ────────
+                        if "flood" in err_lower:
                             import re as _re
                             m = _re.search(r'(\d+)', str(e))
-                            if m:
-                                wait = min(int(m.group(1)), 120)
-                            blocked_until[acc.id] = time.time() + wait
-                            # Try switching account
+                            wait_secs = min(int(m.group(1)), 120) if m else 60
+                            blocked_until[acc.id] = time.time() + wait_secs
+
+                            async with async_session() as db:
+                                db.add(Log(level="warn", category="message", account_id=acc.id,
+                                           message=f"FloodWait {wait_secs}s — blocked temporarily"))
+                                await db.commit()
+
+                            # Try switching to another account (each with its own proxy)
                             switched = False
                             for a2, c2, p2 in clients:
                                 if a2.id != acc.id and a2.id not in blocked_until:
-                                    acc, client, cur_proxy = a2, c2, p2
-                                    switched = True
-                                    break
+                                    if max_per_acct <= 0 or account_counts[a2.id] < max_per_acct:
+                                        acc, client, cur_proxy = a2, c2, p2
+                                        switched = True
+                                        break
                             if not switched:
-                                await asyncio.sleep(min(wait, 30))
-                        elif any(x in err for x in ("deactivated", "banned", "auth_key")):
+                                # No other account available — wait and retry same
+                                await asyncio.sleep(min(wait_secs, 30))
+                            # retry loop continues
+
+                        # ── Account banned / deactivated ─────────────────────
+                        elif any(x in err_lower for x in
+                                 ("deactivated", "banned", "auth_key", "user_deactivated")):
                             async with async_session() as db:
                                 acc_row = await db.get(Account, acc.id)
                                 if acc_row:
                                     acc_row.status = "banned"
                                     acc_row.is_active = False
                                 db.add(Log(level="error", category="message", account_id=acc.id,
-                                           message=f"Account banned/deactivated during send"))
+                                           message="Account banned/deactivated"))
                                 await db.commit()
                             clients = [(a, c, p) for a, c, p in clients if a.id != acc.id]
                             if not clients:
                                 job["status"] = "failed"
                                 job["message"] = "All accounts banned"
                                 return
-                            break
+                            break  # move to next target
+
+                        # ── Other errors: log clearly, retry with backoff ──────
                         else:
-                            # Generic error — try proxy rotation
-                            if rotate_proxies and all_proxies and retry < 2:
-                                proxy_pool_idx = (proxy_pool_idx + 1) % len(all_proxies)
-                                new_proxy = all_proxies[proxy_pool_idx]
-                                try:
-                                    client = await client_manager.get_client(
-                                        acc.id, acc.phone, new_proxy)
-                                    cur_proxy = new_proxy
-                                    clients = [(a, client if a.id == acc.id else c,
-                                                new_proxy if a.id == acc.id else p)
-                                               for a, c, p in clients]
-                                except Exception:
-                                    pass
+                            proxy_label = f"{cur_proxy.host}:{cur_proxy.port}" if cur_proxy else "direct"
+                            err_msg = f"Send to {target} via {proxy_label} failed (retry {retry+1}/3): {e}"
+                            logger.warning(err_msg)
+                            async with async_session() as db:
+                                db.add(Log(level="error", category="message", account_id=acc.id,
+                                           message=err_msg))
+                                await db.commit()
+                            if retry < 2:
+                                await asyncio.sleep(2 ** retry)  # 1s, 2s backoff
                             else:
-                                async with async_session() as db:
-                                    db.add(Log(level="error", category="message", account_id=acc.id,
-                                               message=f"Failed to send to {target}: {e}"))
-                                    await db.commit()
-                                break
+                                break  # 3 retries exhausted
 
                 if not sent_ok:
                     job["failed"] += 1
-                    failed_targets.append({"target": target, "error": "retries exhausted",
+                    # Get the actual error from the last attempt
+                    last_error = "failed after retries"
+                    failed_targets.append({"target": target,
+                                           "error": last_error,
                                            "message_text": text})
+                    logger.error("Failed to send to %s after 3 retries", target)
 
                 if i < len(targets) - 1 and not job.get("cancelled"):
                     await asyncio.sleep(random.uniform(delay_min, delay_max))
 
-            # Save failed messages
+            # ── Save failed messages to DB ────────────────────────────────────
             if failed_targets:
                 async with async_session() as db:
                     for ft in failed_targets:
@@ -623,7 +849,15 @@ class ServiceManager:
         except Exception as e:
             job["status"] = "failed"
             job["message"] = str(e)
-            logger.exception("Send job %s failed", job_id)
+            logger.exception("Send job %s failed: %s", job_id, e)
+            # Also log to DB so user can see in Logs page
+            try:
+                async with async_session() as db:
+                    db.add(Log(level="error", category="message",
+                               message=f"Send job {job_id} crashed: {e}"))
+                    await db.commit()
+            except Exception as _log_err:
+                logger.warning("Could not write crash log to DB: %s", _log_err)
 
     # ── Campaigns ─────────────────────────────────────────────────────────────
 
@@ -682,8 +916,8 @@ class ServiceManager:
             c = await db.get(Campaign, campaign_id)
             if not c:
                 raise Exception("Campaign not found")
-            account_ids = json.loads(c.account_ids) if c.account_ids else []
-            targets     = json.loads(c.targets)     if c.targets     else []
+            account_ids = self._safe_json(c.account_ids)
+            targets     = self._safe_json(c.targets)
             if not account_ids or not targets:
                 raise Exception("Campaign has no accounts or targets configured")
             c.status = "running"
@@ -698,7 +932,7 @@ class ServiceManager:
             "delay_max":       c.delay_max,
             "mode":            "round_robin",
             "max_per_account": c.max_per_account,
-            "rotate_proxies":  c.rotate_proxies,
+            "rotate_proxies":  False,  # each account uses its own assigned proxy
             "auto_retry":      c.auto_retry,
             "campaign_id":     campaign_id,
         })
@@ -737,8 +971,8 @@ class ServiceManager:
         return {
             "id": c.id, "name": c.name,
             "message_text": c.message_text or "",
-            "account_ids": json.loads(c.account_ids) if c.account_ids else [],
-            "targets": json.loads(c.targets) if c.targets else [],
+            "account_ids": self._safe_json(c.account_ids),
+            "targets": self._safe_json(c.targets),
             "status": c.status or "draft",
             "delay_min": c.delay_min or 30,
             "delay_max": c.delay_max or 60,
@@ -861,8 +1095,8 @@ class ServiceManager:
                 try:
                     c = await client_manager.get_client(acc.id, acc.phone, acc.proxy)
                     clients.append((acc, c))
-                except Exception:
-                    pass
+                except Exception as _conn_err:
+                    logger.error("Account %s failed to connect: %s", acc.id, _conn_err)
 
             if not clients:
                 job["status"] = "failed"
@@ -997,6 +1231,443 @@ class ServiceManager:
         dst = MEDIA_DIR / filename
         shutil.copy2(src, dst)
         return str(dst.relative_to(BASE_DIR))
+
+
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PEERS
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def get_peers(self) -> List[dict]:
+        async with async_session() as db:
+            result = await db.execute(select(Peer).order_by(Peer.created_at.desc()))
+            peers = result.scalars().all()
+            out = []
+            for p in peers:
+                count = await db.scalar(
+                    select(func.count(Contact.id)).where(Contact.peer_id == p.id))
+                out.append({**self._ser_peer(p), "contact_count": count or 0})
+            return out
+
+    async def get_peer(self, peer_id: int) -> Optional[dict]:
+        async with async_session() as db:
+            p = await db.get(Peer, peer_id)
+            if not p:
+                return None
+            count = await db.scalar(
+                select(func.count(Contact.id)).where(Contact.peer_id == peer_id))
+            return {**self._ser_peer(p), "contact_count": count or 0}
+
+    async def create_peer(self, data: dict) -> dict:
+        async with async_session() as db:
+            p = Peer(
+                title=data["title"],
+                description=data.get("description", ""),
+                color=data.get("color", "#58A6FF"),
+            )
+            db.add(p)
+            await db.commit()
+            await db.refresh(p)
+            await self._notify("peer_created", {"id": p.id, "title": p.title})
+            return {**self._ser_peer(p), "contact_count": 0}
+
+    async def update_peer(self, peer_id: int, data: dict) -> dict:
+        async with async_session() as db:
+            p = await db.get(Peer, peer_id)
+            if not p:
+                raise Exception("Peer not found")
+            for field in ("title", "description", "color"):
+                if field in data:
+                    setattr(p, field, data[field])
+            await db.commit()
+            await db.refresh(p)
+            count = await db.scalar(
+                select(func.count(Contact.id)).where(Contact.peer_id == peer_id))
+            return {**self._ser_peer(p), "contact_count": count or 0}
+
+    async def delete_peer(self, peer_id: int) -> bool:
+        async with async_session() as db:
+            p = await db.get(Peer, peer_id)
+            if not p:
+                raise Exception("Peer not found")
+            await db.delete(p)   # cascade deletes contacts
+            await db.commit()
+            await self._notify("peer_deleted", {"id": peer_id})
+            return True
+
+    def _ser_peer(self, p: Peer) -> dict:
+        return {
+            "id": p.id, "title": p.title,
+            "description": p.description or "",
+            "color": p.color or "#58A6FF",
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+        }
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CONTACTS
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def get_contacts(self, peer_id: int, status: Optional[str] = None,
+                           search: Optional[str] = None,
+                           limit: int = 500, offset: int = 0) -> List[dict]:
+        async with async_session() as db:
+            q = select(Contact).where(Contact.peer_id == peer_id)
+            if status:
+                q = q.where(Contact.status == status)
+            if search:
+                q = q.where(
+                    (Contact.value.ilike(f"%{search}%")) |
+                    (Contact.label.ilike(f"%{search}%"))
+                )
+            q = q.order_by(Contact.created_at.desc()).limit(limit).offset(offset)
+            result = await db.execute(q)
+            return [self._ser_contact(c) for c in result.scalars().all()]
+
+    async def get_peer_contact_count(self, peer_id: int) -> dict:
+        """Returns counts per status for a peer."""
+        async with async_session() as db:
+            statuses = ["pending", "sent", "failed", "invalid", "duplicate"]
+            counts = {}
+            for s in statuses:
+                counts[s] = await db.scalar(
+                    select(func.count(Contact.id)).where(
+                        Contact.peer_id == peer_id, Contact.status == s)) or 0
+            counts["total"] = sum(counts.values())
+            return counts
+
+    async def bulk_import_contacts(self, peer_id: int, raw_text: str,
+                                   fmt: str = "auto") -> dict:
+        """
+        Parse and bulk-insert contacts from raw text.
+
+        fmt: "auto" | "phone" | "username" | "csv"
+
+        CSV format: first column = value, second (optional) = label
+        TXT format: one value per line
+        """
+        import csv, io, re
+
+        async with async_session() as db:
+            p = await db.get(Peer, peer_id)
+            if not p:
+                raise Exception("Peer not found")
+
+        # ── Parse ─────────────────────────────────────────────────────────────
+        entries: list[tuple[str, str]] = []  # (value, label)
+        lines = [l.strip() for l in raw_text.strip().splitlines() if l.strip()]
+
+        for line in lines:
+            # Try CSV (comma-separated)
+            if "," in line:
+                parts = [p.strip() for p in line.split(",", 1)]
+                value = parts[0]
+                label = parts[1] if len(parts) > 1 else ""
+            else:
+                value = line
+                label = ""
+
+            # Normalize value
+            if value.startswith("@"):
+                pass  # username — keep as is
+            elif value.lstrip("+").isdigit() and len(value.lstrip("+")) >= 7:
+                # Phone number — ensure + prefix
+                if not value.startswith("+"):
+                    value = f"+{value}"
+            elif value.isdigit() and len(value) > 5:
+                pass  # user_id
+            else:
+                continue  # skip unrecognizable
+
+            if value:
+                entries.append((value, label))
+
+        if not entries:
+            return {"imported": 0, "skipped": 0, "duplicates": 0, "total": len(lines)}
+
+        # ── Get existing values for this peer (duplicate check) ───────────────
+        async with async_session() as db:
+            existing_result = await db.execute(
+                select(Contact.value).where(Contact.peer_id == peer_id))
+            existing_values = {row[0] for row in existing_result.all()}
+
+        # ── Bulk insert ───────────────────────────────────────────────────────
+        imported = duplicates = skipped = 0
+        batch_size = 500
+
+        async with async_session() as db:
+            batch = []
+            for value, label in entries:
+                if value in existing_values:
+                    duplicates += 1
+                    continue
+                existing_values.add(value)  # prevent same-batch duplicates
+                batch.append(Contact(
+                    peer_id=peer_id,
+                    value=value,
+                    label=label,
+                    status="pending",
+                ))
+                imported += 1
+
+                if len(batch) >= batch_size:
+                    db.add_all(batch)
+                    await db.commit()
+                    batch = []
+
+            if batch:
+                db.add_all(batch)
+                await db.commit()
+
+        await self._notify("contacts_imported",
+                           {"peer_id": peer_id, "count": imported})
+        return {
+            "imported": imported,
+            "duplicates": duplicates,
+            "skipped": skipped,
+            "total": len(lines),
+        }
+
+    async def delete_contact(self, contact_id: int) -> bool:
+        async with async_session() as db:
+            c = await db.get(Contact, contact_id)
+            if not c:
+                raise Exception("Contact not found")
+            await db.delete(c)
+            await db.commit()
+            return True
+
+    async def clear_peer_contacts(self, peer_id: int,
+                                   status_filter: Optional[str] = None) -> int:
+        """Delete all (or filtered) contacts from a peer."""
+        from sqlalchemy import delete as sa_delete
+        async with async_session() as db:
+            q = sa_delete(Contact).where(Contact.peer_id == peer_id)
+            if status_filter:
+                q = q.where(Contact.status == status_filter)
+            result = await db.execute(q)
+            await db.commit()
+            return result.rowcount
+
+    async def export_peer_contacts(self, peer_id: int,
+                                    fmt: str = "txt") -> str:
+        """Return contacts as a string (txt or csv)."""
+        async with async_session() as db:
+            result = await db.execute(
+                select(Contact).where(Contact.peer_id == peer_id)
+                .order_by(Contact.created_at))
+            contacts = result.scalars().all()
+
+        if fmt == "csv":
+            lines = ["value,label,status"]
+            for c in contacts:
+                lines.append(f"{c.value},{c.label or ''},{c.status}")
+        else:  # txt
+            lines = [c.value for c in contacts]
+
+        return "\n".join(lines)
+
+    async def update_contact_status(self, contact_value: str,
+                                     peer_id: int, status: str,
+                                     resolved_id: Optional[int] = None):
+        """Called after send to mark contact status."""
+        async with async_session() as db:
+            result = await db.execute(
+                select(Contact).where(
+                    Contact.peer_id == peer_id,
+                    Contact.value == contact_value))
+            contact = result.scalar_one_or_none()
+            if contact:
+                contact.status = status
+                if resolved_id:
+                    contact.resolved_id = resolved_id
+                await db.commit()
+
+    async def get_peer_targets(self, peer_id: int) -> List[str]:
+        """Get all contact values from a peer for sending."""
+        async with async_session() as db:
+            result = await db.execute(
+                select(Contact.value).where(
+                    Contact.peer_id == peer_id,
+                    Contact.status.notin_(["invalid", "duplicate"])))
+            return [row[0] for row in result.all()]
+
+    def _ser_contact(self, c: Contact) -> dict:
+        return {
+            "id": c.id, "peer_id": c.peer_id,
+            "value": c.value, "label": c.label or "",
+            "status": c.status, "resolved_id": c.resolved_id,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+        }
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TEMPLATE CATEGORIES
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def get_template_categories(self) -> List[dict]:
+        async with async_session() as db:
+            result = await db.execute(
+                select(TemplateCategory).order_by(TemplateCategory.name))
+            return [{"id": c.id, "name": c.name, "color": c.color}
+                    for c in result.scalars().all()]
+
+    async def create_template_category(self, name: str,
+                                        color: str = "#3FB950") -> dict:
+        async with async_session() as db:
+            cat = TemplateCategory(name=name, color=color)
+            db.add(cat)
+            await db.commit()
+            await db.refresh(cat)
+            return {"id": cat.id, "name": cat.name, "color": cat.color}
+
+    async def delete_template_category(self, cat_id: int) -> bool:
+        async with async_session() as db:
+            cat = await db.get(TemplateCategory, cat_id)
+            if not cat:
+                raise Exception("Category not found")
+            # Unlink templates
+            result = await db.execute(
+                select(MessageTemplate).where(
+                    MessageTemplate.category_id == cat_id))
+            for t in result.scalars().all():
+                t.category_id = None
+            await db.delete(cat)
+            await db.commit()
+            return True
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TEMPLATES (upgraded)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def get_templates(self) -> List[dict]:
+        async with async_session() as db:
+            from sqlalchemy.orm import selectinload as _sil
+            result = await db.execute(
+                select(MessageTemplate)
+                .options(_sil(MessageTemplate.variants),
+                         _sil(MessageTemplate.category))
+                .order_by(MessageTemplate.created_at.desc()))
+            return [self._ser_template_full(t) for t in result.scalars().all()]
+
+    async def create_template(self, data: dict) -> dict:
+        async with async_session() as db:
+            t = MessageTemplate(
+                name=data["name"],
+                text=data.get("text", ""),
+                media_path=data.get("media_path") or "",
+                media_type=data.get("media_type") or "",
+                category_id=data.get("category_id"),
+                use_variants=data.get("use_variants", False),
+                variables_used=_json.dumps(data.get("variables_used", [])),
+            )
+            db.add(t)
+            await db.flush()
+
+            # Add variants
+            for i, vtext in enumerate(data.get("variants", [])):
+                if vtext.strip():
+                    db.add(TemplateVariant(
+                        template_id=t.id, text=vtext, order=i))
+
+            await db.commit()
+            await db.refresh(t)
+            return self._ser_template_full(t)
+
+    async def update_template(self, template_id: int, data: dict) -> dict:
+        async with async_session() as db:
+            from sqlalchemy.orm import selectinload as _sil
+            result = await db.execute(
+                select(MessageTemplate)
+                .options(_sil(MessageTemplate.variants))
+                .where(MessageTemplate.id == template_id))
+            t = result.scalar_one_or_none()
+            if not t:
+                raise Exception("Template not found")
+
+            for field in ("name", "text", "media_path", "media_type",
+                          "category_id", "use_variants"):
+                if field in data and data[field] is not None:
+                    setattr(t, field, data[field])
+
+            if "variables_used" in data:
+                t.variables_used = _json.dumps(data["variables_used"])
+
+            # Replace variants if provided
+            if "variants" in data:
+                for v in t.variants:
+                    await db.delete(v)
+                await db.flush()
+                for i, vtext in enumerate(data["variants"]):
+                    if vtext.strip():
+                        db.add(TemplateVariant(
+                            template_id=t.id, text=vtext, order=i))
+
+            await db.commit()
+            await db.refresh(t)
+            return self._ser_template_full(t)
+
+    async def delete_template(self, template_id: int) -> bool:
+        async with async_session() as db:
+            t = await db.get(MessageTemplate, template_id)
+            if not t:
+                raise Exception("Template not found")
+            if t.media_path:
+                p = MEDIA_DIR / t.media_path
+                if p.exists():
+                    p.unlink()
+            await db.delete(t)
+            await db.commit()
+            return True
+
+    async def preview_template(self, template_id: int,
+                                sample_vars: dict) -> str:
+        """Render template with sample variables for preview."""
+        async with async_session() as db:
+            from sqlalchemy.orm import selectinload as _sil
+            result = await db.execute(
+                select(MessageTemplate)
+                .options(_sil(MessageTemplate.variants))
+                .where(MessageTemplate.id == template_id))
+            t = result.scalar_one_or_none()
+            if not t:
+                raise Exception("Template not found")
+
+        text = _pick_template_text(t, "")
+        if not text:
+            return ""
+
+        defaults = {
+            "name": "Ahmed Ali",
+            "username": "@ahmed_ali",
+            "phone": "+923001234567",
+            "custom_1": "Value1",
+            "custom_2": "Value2",
+        }
+        variables = {**defaults, **sample_vars}
+        for k, v in variables.items():
+            text = text.replace(f"{{{k}}}", str(v))
+        return text
+
+    def _ser_template_full(self, t: MessageTemplate) -> dict:
+        try:
+            vars_used = _json.loads(t.variables_used) if t.variables_used else []
+        except Exception:
+            vars_used = []
+        return {
+            "id": t.id,
+            "name": t.name,
+            "text": t.text or "",
+            "media_path": t.media_path or "",
+            "media_type": t.media_type or "",
+            "category_id": t.category_id,
+            "category": {"id": t.category.id, "name": t.category.name,
+                         "color": t.category.color} if t.category else None,
+            "use_variants": t.use_variants,
+            "variables_used": vars_used,
+            "variants": [{"id": v.id, "text": v.text, "order": v.order}
+                         for v in (t.variants or [])],
+            "variant_count": len(t.variants or []),
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+        }
 
 
 # ── Singleton ─────────────────────────────────────────────────────────────────

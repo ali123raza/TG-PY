@@ -331,29 +331,6 @@ class DashboardPage(QWidget):
         title.setStyleSheet(f"font-size: 32px; font-weight: bold; color: {COLORS['text_primary']}; padding-left: 12px;")
         title_layout.addWidget(title)
         title_layout.addStretch()
-        
-        # Refresh button
-        refresh_btn = QPushButton("🔄 Refresh")
-        refresh_btn.setFixedHeight(32)
-        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        refresh_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {COLORS['bg_tertiary']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 6px;
-                color: {COLORS['text_secondary']};
-                font-weight: 600; font-size: 12px;
-                padding: 0 12px;
-            }}
-            QPushButton:hover {{
-                background: {COLORS['accent_blue_dark']};
-                border-color: {COLORS['accent_blue']};
-                color: white;
-            }}
-        """)
-        refresh_btn.clicked.connect(self.fetch_stats)
-        title_layout.addWidget(refresh_btn)
-        
         layout.addWidget(title_container)
 
         stats_grid = QGridLayout()
@@ -491,28 +468,6 @@ class AccountsPage(QWidget):
         title.setStyleSheet(f"font-size: 32px; font-weight: bold; color: {COLORS['text_primary']}; padding-left: 12px;")
         header.addWidget(title)
         header.addStretch()
-
-        # Refresh button
-        refresh_btn = QPushButton("🔄 Refresh")
-        refresh_btn.setFixedHeight(32)
-        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        refresh_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {COLORS['bg_tertiary']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 6px;
-                color: {COLORS['text_secondary']};
-                font-weight: 600; font-size: 12px;
-                padding: 0 12px;
-            }}
-            QPushButton:hover {{
-                background: {COLORS['accent_blue_dark']};
-                border-color: {COLORS['accent_blue']};
-                color: white;
-            }}
-        """)
-        refresh_btn.clicked.connect(self.fetch_data)
-        header.addWidget(refresh_btn)
 
         self.load_sessions_btn = QPushButton("Load Sessions")
         self.load_sessions_btn.clicked.connect(self.load_sessions)
@@ -1011,29 +966,6 @@ class MessagingPage(QWidget):
         title.setStyleSheet(f"font-size: 32px; font-weight: bold; color: {COLORS['text_primary']}; padding-left: 12px;")
         title_layout.addWidget(title)
         title_layout.addStretch()
-        
-        # Refresh button
-        refresh_btn = QPushButton("🔄 Refresh")
-        refresh_btn.setFixedHeight(32)
-        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        refresh_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {COLORS['bg_tertiary']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 6px;
-                color: {COLORS['text_secondary']};
-                font-weight: 600; font-size: 12px;
-                padding: 0 12px;
-            }}
-            QPushButton:hover {{
-                background: {COLORS['accent_blue_dark']};
-                border-color: {COLORS['accent_blue']};
-                color: white;
-            }}
-        """)
-        refresh_btn.clicked.connect(self.fetch_data)
-        title_layout.addWidget(refresh_btn)
-        
         layout.addWidget(title_container)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1286,7 +1218,15 @@ class MessagingPage(QWidget):
             toast_warning("Please select at least one account")
             return
 
-        # Handle peer mode first (selected peer provides targets)
+        targets_text = self.targets_input.toPlainText().strip()
+        if not targets_text:
+            toast_warning("Please enter at least one target")
+            return
+
+        # Parse targets — skip blank lines
+        targets = [t.strip() for t in targets_text.split("\n") if t.strip()]
+
+        # Override with peer targets if peer mode is active
         if self.targets_mode_peer.isChecked():
             peer_id = self.peer_selector_combo.currentData()
             if not peer_id:
@@ -1301,14 +1241,6 @@ class MessagingPage(QWidget):
             except Exception as e:
                 toast_error(f"Could not load peer contacts: {e}")
                 return
-        else:
-            # Custom input mode - validate text input
-            targets_text = self.targets_input.toPlainText().strip()
-            if not targets_text:
-                toast_warning("Please enter at least one target")
-                return
-            # Parse targets — skip blank lines
-            targets = [t.strip() for t in targets_text.split("\n") if t.strip()]
 
         # Check message
         msg_text    = self.message_input.toPlainText().strip()
@@ -1445,29 +1377,6 @@ class CampaignsPage(QWidget):
         title.setStyleSheet(f"font-size: 32px; font-weight: bold; color: {COLORS['text_primary']}; padding-left: 12px;")
         header.addWidget(title)
         header.addStretch()
-        
-        # Refresh button
-        refresh_btn = QPushButton("🔄 Refresh")
-        refresh_btn.setFixedHeight(32)
-        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        refresh_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {COLORS['bg_tertiary']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 6px;
-                color: {COLORS['text_secondary']};
-                font-weight: 600; font-size: 12px;
-                padding: 0 12px;
-            }}
-            QPushButton:hover {{
-                background: {COLORS['accent_blue_dark']};
-                border-color: {COLORS['accent_blue']};
-                color: white;
-            }}
-        """)
-        refresh_btn.clicked.connect(self.fetch_data)
-        header.addWidget(refresh_btn)
-        
         self.create_btn = QPushButton("+ Create Campaign")
         self.create_btn.setProperty("primary", True)
         self.create_btn.clicked.connect(self.create_campaign)
@@ -1560,16 +1469,46 @@ class CampaignsPage(QWidget):
     def create_campaign(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("Create Campaign")
-        dialog.setMinimumSize(500, 600)
+        dialog.setMinimumSize(540, 660)
+        dialog.setStyleSheet(f"""
+            QDialog {{ background: {COLORS['bg_secondary']}; }}
+            QLabel {{ color: {COLORS['text_primary']}; font-size: 13px; }}
+            QLineEdit, QTextEdit, QComboBox, QSpinBox {{
+                background: {COLORS['bg_primary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px; padding: 8px;
+                color: {COLORS['text_primary']};
+            }}
+            QListWidget {{
+                background: {COLORS['bg_primary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px;
+            }}
+            QPushButton {{
+                background: {COLORS['bg_tertiary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px; padding: 8px 16px;
+                color: {COLORS['text_primary']};
+            }}
+            QPushButton:hover {{ background: {COLORS['bg_hover']}; }}
+        """)
         layout = QVBoxLayout(dialog)
         scroll = QScrollArea()
         scroll_widget = QWidget()
+        scroll_widget.setStyleSheet("background: transparent;")
         form_layout = QVBoxLayout(scroll_widget)
-        form_layout.addWidget(QLabel("Campaign Name:"))
+        form_layout.setSpacing(10)
+
+        # ── Name ──────────────────────────────────────────────────────────────
+        form_layout.addWidget(QLabel("Campaign Name *"))
         name_input = QLineEdit()
+        name_input.setPlaceholderText("e.g. Pakistan Leads Nov")
         form_layout.addWidget(name_input)
-        form_layout.addWidget(QLabel("Select Accounts:"))
+
+        # ── Accounts ──────────────────────────────────────────────────────────
+        form_layout.addWidget(QLabel("Select Accounts (Ctrl+Click for multiple)"))
         accounts_list = QListWidget()
+        accounts_list.setMaximumHeight(110)
         accounts_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
         try:
             for acc in self.data.get_accounts():
@@ -1579,14 +1518,99 @@ class CampaignsPage(QWidget):
         except Exception:
             pass
         form_layout.addWidget(accounts_list)
-        form_layout.addWidget(QLabel("Targets (one per line):"))
+
+        # ── Targets — Peer OR Custom ──────────────────────────────────────────
+        targets_header = QHBoxLayout()
+        targets_header.addWidget(QLabel("Targets"))
+        use_peer_btn   = QPushButton("👥 Use Peer")
+        use_custom_btn = QPushButton("✏ Custom Input")
+        use_peer_btn.setCheckable(True)
+        use_custom_btn.setCheckable(True)
+        use_custom_btn.setChecked(True)
+        for tbtn in (use_peer_btn, use_custom_btn):
+            tbtn.setFixedHeight(26)
+            tbtn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['bg_tertiary']};
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 5px; padding: 0 10px;
+                    color: {COLORS['text_secondary']}; font-size: 12px;
+                }}
+                QPushButton:checked {{
+                    background: {COLORS['accent_blue_dark']};
+                    border-color: {COLORS['accent_blue']};
+                    color: white; font-weight: 600;
+                }}
+                QPushButton:hover:!checked {{ background: {COLORS['bg_hover']}; }}
+            """)
+        targets_header.addWidget(use_custom_btn)
+        targets_header.addWidget(use_peer_btn)
+        targets_header.addStretch()
+        form_layout.addLayout(targets_header)
+
+        # Custom input
+        custom_widget = QWidget()
+        custom_widget.setStyleSheet("background: transparent;")
+        cwl = QVBoxLayout(custom_widget)
+        cwl.setContentsMargins(0, 0, 0, 0)
         targets_input = QTextEdit()
-        targets_input.setMaximumHeight(100)
-        form_layout.addWidget(targets_input)
-        form_layout.addWidget(QLabel("Message:"))
+        targets_input.setMaximumHeight(90)
+        targets_input.setPlaceholderText("+923001234567\n@username\nuser_id")
+        cwl.addWidget(targets_input)
+        form_layout.addWidget(custom_widget)
+
+        # Peer selector
+        peer_widget = QWidget()
+        peer_widget.setStyleSheet("background: transparent;")
+        pwl = QVBoxLayout(peer_widget)
+        pwl.setContentsMargins(0, 0, 0, 0)
+        peer_combo = QComboBox()
+        peer_combo.addItem("— Select a peer —", None)
+        peer_count_lbl = QLabel("")
+        peer_count_lbl.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
+        try:
+            for p in self.data.get_peers():
+                peer_combo.addItem(
+                    f"● {p['title']}  ({p.get('contact_count', 0):,} contacts)",
+                    p["id"])
+        except Exception:
+            pass
+        pwl.addWidget(peer_combo)
+        pwl.addWidget(peer_count_lbl)
+        peer_widget.setVisible(False)
+        form_layout.addWidget(peer_widget)
+
+        def _on_peer_selected():
+            pid = peer_combo.currentData()
+            if pid:
+                try:
+                    counts = self.data.get_peer_contact_count(pid)
+                    peer_count_lbl.setText(
+                        f"{counts.get('total',0):,} contacts  |  "
+                        f"{counts.get('pending',0):,} pending")
+                except Exception:
+                    peer_count_lbl.setText("")
+            else:
+                peer_count_lbl.setText("")
+
+        peer_combo.currentIndexChanged.connect(_on_peer_selected)
+
+        def _toggle_targets(use_peer: bool):
+            use_peer_btn.setChecked(use_peer)
+            use_custom_btn.setChecked(not use_peer)
+            peer_widget.setVisible(use_peer)
+            custom_widget.setVisible(not use_peer)
+
+        use_peer_btn.clicked.connect(lambda: _toggle_targets(True))
+        use_custom_btn.clicked.connect(lambda: _toggle_targets(False))
+
+        # ── Message / Template ────────────────────────────────────────────────
+        form_layout.addWidget(QLabel("Message (or use template below)"))
         message_input = QTextEdit()
+        message_input.setMaximumHeight(80)
         form_layout.addWidget(message_input)
-        form_layout.addWidget(QLabel("Or use Template:"))
+
+        form_layout.addWidget(QLabel("Template (optional)"))
         template_combo = QComboBox()
         template_combo.addItem("None", None)
         try:
@@ -1595,6 +1619,8 @@ class CampaignsPage(QWidget):
         except Exception:
             pass
         form_layout.addWidget(template_combo)
+
+        # ── Delay ─────────────────────────────────────────────────────────────
         delay_layout = QHBoxLayout()
         delay_layout.addWidget(QLabel("Delay Min (s):"))
         delay_min = QSpinBox()
@@ -1608,38 +1634,84 @@ class CampaignsPage(QWidget):
         delay_layout.addWidget(delay_max)
         delay_layout.addStretch()
         form_layout.addLayout(delay_layout)
+
         rotate_accounts = QCheckBox("Rotate Accounts")
         rotate_accounts.setChecked(True)
         form_layout.addWidget(rotate_accounts)
-        auto_retry = QCheckBox("Auto Retry")
+        auto_retry = QCheckBox("Auto Retry Failed")
         form_layout.addWidget(auto_retry)
+
         scroll.setWidget(scroll_widget)
         scroll.setWidgetResizable(True)
         layout.addWidget(scroll)
+
         buttons = QHBoxLayout()
-        save_btn = QPushButton("Create")
-        save_btn.setProperty("primary", True)
+        save_btn = QPushButton("Create Campaign")
+        save_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['gradient_green']};
+                border: none; border-radius: 8px;
+                color: white; font-weight: 600; padding: 10px 24px;
+            }}
+            QPushButton:hover {{ background: {COLORS['accent_green_dark']}; }}
+        """)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(dialog.reject)
         buttons.addStretch()
-        buttons.addWidget(save_btn)
         buttons.addWidget(cancel_btn)
+        buttons.addWidget(save_btn)
         layout.addLayout(buttons)
 
         def save():
+            if not name_input.text().strip():
+                toast_warning("Enter a campaign name")
+                return
             selected = accounts_list.selectedItems()
             account_ids = [item.data(Qt.ItemDataRole.UserRole) for item in selected]
-            targets = [t.strip() for t in targets_input.toPlainText().strip().split('\n') if t.strip()]
+            if not account_ids:
+                toast_warning("Select at least one account")
+                return
+
+            # Resolve targets — peer or custom
+            if use_peer_btn.isChecked():
+                peer_id = peer_combo.currentData()
+                if not peer_id:
+                    toast_warning("Select a peer")
+                    return
+                try:
+                    targets = self.data.get_peer_targets(peer_id)
+                    if not targets:
+                        toast_warning("Selected peer has no contacts")
+                        return
+                    toast_info(f"Using peer: {len(targets):,} contacts")
+                except Exception as e:
+                    toast_error(f"Could not load peer: {e}")
+                    return
+            else:
+                targets = [t.strip() for t in targets_input.toPlainText().strip().split('\n')
+                           if t.strip()]
+                if not targets:
+                    toast_warning("Enter at least one target")
+                    return
+
+            if not message_input.toPlainText().strip() and not template_combo.currentData():
+                toast_warning("Enter a message or select a template")
+                return
+
             data = {
-                "name": name_input.text(), "account_ids": account_ids,
-                "targets": targets, "message_text": message_input.toPlainText(),
-                "template_id": template_combo.currentData(),
-                "delay_min": delay_min.value(), "delay_max": delay_max.value(),
-                "rotate_accounts": rotate_accounts.isChecked(), "auto_retry": auto_retry.isChecked(),
+                "name":            name_input.text().strip(),
+                "account_ids":     account_ids,
+                "targets":         targets,
+                "message_text":    message_input.toPlainText(),
+                "template_id":     template_combo.currentData(),
+                "delay_min":       delay_min.value(),
+                "delay_max":       delay_max.value(),
+                "rotate_accounts": rotate_accounts.isChecked(),
+                "auto_retry":      auto_retry.isChecked(),
             }
             try:
                 self.data.create_campaign(data)
-                toast_success("Campaign created!")
+                toast_success(f"Campaign created — {len(targets):,} targets")
                 dialog.accept()
                 self.fetch_data()
             except Exception as e:
@@ -1664,67 +1736,279 @@ class CampaignsPage(QWidget):
             toast_error(f"Failed to run: {e}")
 
     def edit_campaign(self, campaign: Campaign):
-        """Open a pre-filled create dialog to edit an existing campaign."""
+        """Edit campaign — full form with peer selector, template, accounts."""
         dialog = QDialog(self)
-        dialog.setWindowTitle(f"Edit Campaign — {campaign.name}")
-        dialog.setMinimumSize(500, 580)
+        dialog.setWindowTitle(f"Edit — {campaign.name}")
+        dialog.setMinimumSize(560, 680)
+        dialog.setStyleSheet(f"""
+            QDialog {{ background: {COLORS['bg_secondary']}; }}
+            QLabel {{ color: {COLORS['text_primary']}; font-size: 13px; }}
+            QLineEdit, QTextEdit, QComboBox, QSpinBox {{
+                background: {COLORS['bg_primary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px; padding: 8px;
+                color: {COLORS['text_primary']};
+            }}
+            QListWidget {{
+                background: {COLORS['bg_primary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px;
+            }}
+            QCheckBox {{ color: {COLORS['text_primary']}; spacing: 8px; }}
+            QPushButton {{
+                background: {COLORS['bg_tertiary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px; padding: 8px 16px;
+                color: {COLORS['text_primary']};
+            }}
+            QPushButton:hover {{ background: {COLORS['bg_hover']}; }}
+        """)
         layout = QVBoxLayout(dialog)
         scroll = QScrollArea()
         scroll_widget = QWidget()
+        scroll_widget.setStyleSheet("background: transparent;")
         form_layout = QVBoxLayout(scroll_widget)
+        form_layout.setSpacing(10)
 
-        form_layout.addWidget(QLabel("Campaign Name:"))
+        # ── Name ──────────────────────────────────────────────────────────────
+        form_layout.addWidget(QLabel("Campaign Name *"))
         name_input = QLineEdit(campaign.name)
         form_layout.addWidget(name_input)
 
-        form_layout.addWidget(QLabel("Targets (one per line):"))
-        targets_input = QTextEdit()
-        targets_input.setMaximumHeight(100)
-        targets_input.setPlainText("\n".join(campaign.targets))
-        form_layout.addWidget(targets_input)
+        # ── Accounts ──────────────────────────────────────────────────────────
+        form_layout.addWidget(QLabel("Select Accounts (Ctrl+Click for multiple)"))
+        accounts_list = QListWidget()
+        accounts_list.setMaximumHeight(100)
+        accounts_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        try:
+            all_accs = self.data.get_accounts()
+            for acc in all_accs:
+                item = QListWidgetItem(
+                    f"{acc.get('name') or acc.get('phone')} ({acc.get('status')})")
+                item.setData(Qt.ItemDataRole.UserRole, acc.get('id'))
+                accounts_list.addItem(item)
+                if acc.get('id') in campaign.account_ids:
+                    item.setSelected(True)
+        except Exception:
+            pass
+        form_layout.addWidget(accounts_list)
 
-        form_layout.addWidget(QLabel("Message:"))
+        # ── Targets — Peer OR Custom ──────────────────────────────────────────
+        tgt_header = QHBoxLayout()
+        tgt_header.addWidget(QLabel("Targets"))
+        use_peer_btn   = QPushButton("👥 Use Peer")
+        use_custom_btn = QPushButton("✏ Custom")
+        use_peer_btn.setCheckable(True)
+        use_custom_btn.setCheckable(True)
+        _tgl_style = f"""
+            QPushButton {{
+                background: {COLORS['bg_tertiary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 5px; padding: 0 10px;
+                color: {COLORS['text_secondary']}; font-size: 12px;
+                min-height: 26px;
+            }}
+            QPushButton:checked {{
+                background: {COLORS['accent_blue_dark']};
+                border-color: {COLORS['accent_blue']};
+                color: white; font-weight: 600;
+            }}
+            QPushButton:hover:!checked {{ background: {COLORS['bg_hover']}; }}
+        """
+        use_peer_btn.setStyleSheet(_tgl_style)
+        use_custom_btn.setStyleSheet(_tgl_style)
+        tgt_header.addWidget(use_custom_btn)
+        tgt_header.addWidget(use_peer_btn)
+        tgt_header.addStretch()
+        form_layout.addLayout(tgt_header)
+
+        # Decide initial mode from existing campaign data
+        existing_peer_ids = getattr(campaign, 'peer_ids', [])
+        if not isinstance(existing_peer_ids, list):
+            existing_peer_ids = []
+        _init_peer_mode = bool(existing_peer_ids)
+        use_peer_btn.setChecked(_init_peer_mode)
+        use_custom_btn.setChecked(not _init_peer_mode)
+
+        # Custom widget
+        custom_widget = QWidget()
+        custom_widget.setStyleSheet("background: transparent;")
+        cwl = QVBoxLayout(custom_widget)
+        cwl.setContentsMargins(0, 0, 0, 0)
+        targets_input = QTextEdit()
+        targets_input.setMaximumHeight(90)
+        targets_input.setPlaceholderText("+923001234567\n@username")
+        targets_input.setPlainText("\n".join(campaign.targets))
+        cwl.addWidget(targets_input)
+        custom_widget.setVisible(not _init_peer_mode)
+        form_layout.addWidget(custom_widget)
+
+        # Peer widget
+        peer_widget = QWidget()
+        peer_widget.setStyleSheet("background: transparent;")
+        pwl = QVBoxLayout(peer_widget)
+        pwl.setContentsMargins(0, 0, 0, 0)
+        peer_combo = QComboBox()
+        peer_combo.addItem("— Select a peer —", None)
+        peer_count_lbl = QLabel("")
+        peer_count_lbl.setStyleSheet(
+            f"color: {COLORS['text_secondary']}; font-size: 12px;")
+        try:
+            for p in self.data.get_peers():
+                peer_combo.addItem(
+                    f"● {p['title']}  ({p.get('contact_count', 0):,} contacts)",
+                    p["id"])
+                if p["id"] in existing_peer_ids:
+                    peer_combo.setCurrentIndex(peer_combo.count() - 1)
+        except Exception:
+            pass
+        pwl.addWidget(peer_combo)
+        pwl.addWidget(peer_count_lbl)
+        peer_widget.setVisible(_init_peer_mode)
+        form_layout.addWidget(peer_widget)
+
+        def _on_peer_sel():
+            pid = peer_combo.currentData()
+            if pid:
+                try:
+                    c2 = self.data.get_peer_contact_count(pid)
+                    peer_count_lbl.setText(
+                        f"{c2.get('total',0):,} contacts  |  "
+                        f"{c2.get('pending',0):,} pending")
+                except Exception:
+                    peer_count_lbl.setText("")
+        peer_combo.currentIndexChanged.connect(_on_peer_sel)
+        _on_peer_sel()
+
+        def _toggle(use_peer):
+            use_peer_btn.setChecked(use_peer)
+            use_custom_btn.setChecked(not use_peer)
+            peer_widget.setVisible(use_peer)
+            custom_widget.setVisible(not use_peer)
+        use_peer_btn.clicked.connect(lambda: _toggle(True))
+        use_custom_btn.clicked.connect(lambda: _toggle(False))
+
+        # ── Template ──────────────────────────────────────────────────────────
+        form_layout.addWidget(QLabel("Template (optional)"))
+        template_combo = QComboBox()
+        template_combo.addItem("None — use custom message", None)
+        try:
+            for t in self.data.get_templates():
+                template_combo.addItem(t.get('name'), t.get('id'))
+                if t.get('id') == campaign.template_id:
+                    template_combo.setCurrentIndex(template_combo.count() - 1)
+        except Exception:
+            pass
+        form_layout.addWidget(template_combo)
+
+        # ── Message ───────────────────────────────────────────────────────────
+        form_layout.addWidget(QLabel("Custom Message (ignored if template selected)"))
         message_input = QTextEdit()
+        message_input.setMaximumHeight(80)
         message_input.setPlainText(campaign.message_text)
         form_layout.addWidget(message_input)
 
+        # ── Delay ─────────────────────────────────────────────────────────────
         delay_layout = QHBoxLayout()
         delay_layout.addWidget(QLabel("Delay Min (s):"))
-        delay_min = QSpinBox(); delay_min.setRange(1, 3600); delay_min.setValue(campaign.delay_min)
+        delay_min = QSpinBox()
+        delay_min.setRange(1, 3600)
+        delay_min.setValue(campaign.delay_min)
         delay_layout.addWidget(delay_min)
         delay_layout.addWidget(QLabel("Delay Max (s):"))
-        delay_max = QSpinBox(); delay_max.setRange(1, 3600); delay_max.setValue(campaign.delay_max)
-        delay_layout.addWidget(delay_max); delay_layout.addStretch()
+        delay_max = QSpinBox()
+        delay_max.setRange(1, 3600)
+        delay_max.setValue(campaign.delay_max)
+        delay_layout.addWidget(delay_max)
+        delay_layout.addWidget(QLabel("Max/account:"))
+        max_per = QSpinBox()
+        max_per.setRange(0, 9999)
+        max_per.setSpecialValueText("Unlimited")
+        max_per.setValue(campaign.max_per_account or 0)
+        delay_layout.addWidget(max_per)
+        delay_layout.addStretch()
         form_layout.addLayout(delay_layout)
 
-        auto_retry = QCheckBox("Auto Retry"); auto_retry.setChecked(campaign.auto_retry)
-        form_layout.addWidget(auto_retry)
+        options_row = QHBoxLayout()
+        rotate_cb = QCheckBox("Rotate Accounts")
+        rotate_cb.setChecked(bool(getattr(campaign, 'rotate_accounts', True)))
+        retry_cb  = QCheckBox("Auto Retry Failed")
+        retry_cb.setChecked(bool(campaign.auto_retry))
+        options_row.addWidget(rotate_cb)
+        options_row.addWidget(retry_cb)
+        options_row.addStretch()
+        form_layout.addLayout(options_row)
 
-        scroll.setWidget(scroll_widget); scroll.setWidgetResizable(True)
+        scroll.setWidget(scroll_widget)
+        scroll.setWidgetResizable(True)
         layout.addWidget(scroll)
 
         buttons = QHBoxLayout()
-        save_btn = QPushButton("Save"); save_btn.setProperty("primary", True)
-        cancel_btn = QPushButton("Cancel"); cancel_btn.clicked.connect(dialog.reject)
-        buttons.addStretch(); buttons.addWidget(save_btn); buttons.addWidget(cancel_btn)
+        save_btn = QPushButton("Save Changes")
+        save_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['gradient_blue']};
+                border: none; border-radius: 8px;
+                color: white; font-weight: 600; padding: 10px 24px;
+            }}
+            QPushButton:hover {{ background: {COLORS['accent_blue_dark']}; }}
+        """)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        buttons.addStretch()
+        buttons.addWidget(cancel_btn)
+        buttons.addWidget(save_btn)
         layout.addLayout(buttons)
 
         def save():
-            targets = [t.strip() for t in targets_input.toPlainText().split("\n") if t.strip()]
+            if not name_input.text().strip():
+                toast_warning("Enter a campaign name")
+                return
+            selected_accs = accounts_list.selectedItems()
+            account_ids = [i.data(Qt.ItemDataRole.UserRole) for i in selected_accs]
+
+            # Targets
+            if use_peer_btn.isChecked():
+                pid = peer_combo.currentData()
+                if not pid:
+                    toast_warning("Select a peer")
+                    return
+                try:
+                    targets = self.data.get_peer_targets(pid)
+                    peer_ids_save = [pid]
+                except Exception as e:
+                    toast_error(f"Could not load peer: {e}")
+                    return
+            else:
+                targets = [t.strip() for t in
+                           targets_input.toPlainText().split("\n") if t.strip()]
+                peer_ids_save = []
+
+            tid = template_combo.currentData()
+            msg = message_input.toPlainText().strip()
+            if not tid and not msg:
+                toast_warning("Enter a message or select a template")
+                return
+
             try:
                 self.data.update_campaign(campaign.id, {
-                    "name": name_input.text(),
-                    "message_text": message_input.toPlainText(),
-                    "targets": targets,
-                    "delay_min": delay_min.value(),
-                    "delay_max": delay_max.value(),
-                    "auto_retry": auto_retry.isChecked(),
+                    "name":            name_input.text().strip(),
+                    "account_ids":     account_ids,
+                    "targets":         targets,
+                    "peer_ids":        peer_ids_save,
+                    "template_id":     tid,
+                    "message_text":    msg,
+                    "delay_min":       delay_min.value(),
+                    "delay_max":       delay_max.value(),
+                    "max_per_account": max_per.value(),
+                    "rotate_accounts": rotate_cb.isChecked(),
+                    "auto_retry":      retry_cb.isChecked(),
                 })
                 toast_success("Campaign updated!")
                 dialog.accept()
                 self.fetch_data()
             except Exception as e:
-                toast_error(f"Failed to update: {e}")
+                toast_error(f"Failed: {e}")
 
         save_btn.clicked.connect(save)
         dialog.exec()
@@ -1799,29 +2083,6 @@ class ScraperPage(QWidget):
         title.setStyleSheet(f"font-size: 32px; font-weight: bold; color: {COLORS['text_primary']}; padding-left: 12px;")
         title_layout.addWidget(title)
         title_layout.addStretch()
-        
-        # Refresh button
-        refresh_btn = QPushButton("🔄 Refresh")
-        refresh_btn.setFixedHeight(32)
-        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        refresh_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {COLORS['bg_tertiary']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 6px;
-                color: {COLORS['text_secondary']};
-                font-weight: 600; font-size: 12px;
-                padding: 0 12px;
-            }}
-            QPushButton:hover {{
-                background: {COLORS['accent_blue_dark']};
-                border-color: {COLORS['accent_blue']};
-                color: white;
-            }}
-        """)
-        refresh_btn.clicked.connect(self.fetch_accounts)
-        title_layout.addWidget(refresh_btn)
-        
         layout.addWidget(title_container)
 
         tabs = QTabWidget()
@@ -2081,29 +2342,6 @@ class ProxiesPage(QWidget):
         title.setStyleSheet(f"font-size: 32px; font-weight: bold; color: {COLORS['text_primary']}; padding-left: 12px;")
         header.addWidget(title)
         header.addStretch()
-        
-        # Refresh button
-        refresh_btn = QPushButton("🔄 Refresh")
-        refresh_btn.setFixedHeight(32)
-        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        refresh_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {COLORS['bg_tertiary']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 6px;
-                color: {COLORS['text_secondary']};
-                font-weight: 600; font-size: 12px;
-                padding: 0 12px;
-            }}
-            QPushButton:hover {{
-                background: {COLORS['accent_blue_dark']};
-                border-color: {COLORS['accent_blue']};
-                color: white;
-            }}
-        """)
-        refresh_btn.clicked.connect(self.fetch_data)
-        header.addWidget(refresh_btn)
-        
         self.bulk_btn = QPushButton("Bulk Import")
         self.bulk_btn.clicked.connect(self.bulk_import)
         header.addWidget(self.bulk_btn)
@@ -2329,270 +2567,6 @@ class ProxiesPage(QWidget):
                 toast_error(f"Failed to delete: {e}")
 
 
-class TemplateBuilderDialog(QDialog):
-    def __init__(self, parent=None, template=None, api_client=None):
-        super().__init__(parent)
-        self.data = api_client or data_service
-        self.template = template
-        self.builder_elements = []
-        self.editing_template = template
-
-        self.setWindowTitle("Template Builder")
-        self.setMinimumSize(800, 600)
-        self.setStyleSheet(f"""
-            QDialog {{ background-color: {COLORS['bg_secondary']}; }}
-            QLabel {{ color: {COLORS['text_primary']}; }}
-            QLineEdit, QTextEdit, QComboBox {{ background-color: {COLORS['bg_primary']};
-                border: 1px solid {COLORS['border']}; border-radius: 6px; padding: 8px; color: {COLORS['text_primary']}; }}
-            QLineEdit:focus, QTextEdit:focus, QComboBox:focus {{ border: 1px solid {COLORS['accent_blue']}; }}
-            QPushButton {{ background-color: {COLORS['bg_tertiary']}; border: 1px solid {COLORS['border']};
-                border-radius: 6px; padding: 8px 16px; color: {COLORS['text_primary']}; }}
-            QPushButton:hover {{ background-color: {COLORS['bg_hover']}; }}
-            QPushButton#primary {{ background-color: {COLORS['accent_green']}; border: none; color: {COLORS['text_inverse']}; }}
-            QPushButton#primary:hover {{ background-color: {COLORS['accent_green_dark']}; }}
-            QPushButton#tool {{ background-color: {COLORS['bg_tertiary']}; border: 1px solid {COLORS['border']};
-                text-align: left; padding: 12px; }}
-            QPushButton#tool:hover {{ background-color: {COLORS['bg_hover']}; border: 1px solid {COLORS['accent_blue']}; }}
-        """)
-        self.init_ui()
-        if template:
-            self.load_template(template)
-
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setSpacing(16)
-
-        header = QHBoxLayout()
-        self.name_input = QLineEdit()
-        self.name_input.setPlaceholderText(
-            "Template Name" if not self.editing_template else "Edit template name...")
-        header.addWidget(self.name_input, stretch=1)
-        close_btn = QPushButton("×")
-        close_btn.setFixedSize(32, 32)
-        close_btn.setStyleSheet(f"QPushButton {{ background: transparent; border: none; font-size: 20px; color: {COLORS['text_secondary']}; }}")
-        close_btn.clicked.connect(self.reject)
-        header.addWidget(close_btn)
-        layout.addLayout(header)
-
-        content = QHBoxLayout()
-        toolbox = QVBoxLayout()
-        toolbox_label = QLabel("Elements")
-        toolbox_label.setStyleSheet(f"font-weight: bold; color: {COLORS['text_secondary']};")
-        toolbox.addWidget(toolbox_label)
-        for icon_label, element_type in [("📝 Text","text"),("🖼️ Photo","photo"),
-                                          ("🎥 Video","video"),("🎵 Audio","audio"),("📄 Document","document")]:
-            btn = QPushButton(f"  {icon_label}")
-            btn.setObjectName("tool")
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.clicked.connect(lambda _, t=element_type: self.add_element(t))
-            toolbox.addWidget(btn)
-        toolbox.addStretch()
-        content.addLayout(toolbox, stretch=0)
-
-        canvas_container = QVBoxLayout()
-        self.canvas_widget = QWidget()
-        self.canvas_widget.setStyleSheet(f"""
-            QWidget {{ background-color: {COLORS['bg_primary']};
-                border: 2px dashed {COLORS['border']}; border-radius: 8px; }}
-        """)
-        self.canvas_layout = QVBoxLayout(self.canvas_widget)
-        self.canvas_layout.setSpacing(8)
-        self.canvas_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.empty_label = QLabel("Click elements on the left to add them to your template")
-        self.empty_label.setStyleSheet(f"color: {COLORS['text_muted']}; padding: 40px;")
-        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.canvas_layout.addWidget(self.empty_label)
-        canvas_scroll = QScrollArea()
-        canvas_scroll.setWidget(self.canvas_widget)
-        canvas_scroll.setWidgetResizable(True)
-        canvas_scroll.setMinimumHeight(400)
-        canvas_container.addWidget(canvas_scroll)
-        content.addLayout(canvas_container, stretch=1)
-        layout.addLayout(content, stretch=1)
-
-        bottom = QHBoxLayout()
-        self.elements_count = QLabel("0 elements")
-        self.elements_count.setStyleSheet(f"color: {COLORS['text_secondary']};")
-        bottom.addWidget(self.elements_count)
-        bottom.addStretch()
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        bottom.addWidget(cancel_btn)
-        self.save_btn = QPushButton("Create Template" if not self.editing_template else "Update Template")
-        self.save_btn.setObjectName("primary")
-        self.save_btn.clicked.connect(self.save_template)
-        bottom.addWidget(self.save_btn)
-        layout.addLayout(bottom)
-
-    def load_template(self, template):
-        self.name_input.setText(template.name)
-        if template.text:
-            self.add_element('text', content=template.text)
-        if template.media_path and template.media_type:
-            self.add_element(template.media_type, content=template.media_path, is_existing=True)
-
-    def add_element(self, element_type, content='', is_existing=False):
-        if self.empty_label:
-            self.empty_label.hide()
-        element_id = len(self.builder_elements)
-        element_widget = QWidget()
-        element_widget.setStyleSheet(f"""
-            QWidget {{ background-color: {COLORS['bg_secondary']};
-                border: 1px solid {COLORS['border']}; border-radius: 8px; }}
-        """)
-        element_layout = QHBoxLayout(element_widget)
-        element_layout.setSpacing(8)
-        type_icons = {'text':'📝 Text','photo':'🖼️ Photo','video':'🎥 Video','audio':'🎵 Audio','document':'📄 Doc'}
-        type_label = QLabel(type_icons.get(element_type, element_type))
-        type_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px;")
-        type_label.setFixedWidth(60)
-        element_layout.addWidget(type_label)
-
-        if element_type == 'text':
-            content_widget = QTextEdit()
-            content_widget.setPlainText(content)
-            content_widget.setPlaceholderText("Type your message here...")
-            content_widget.setMinimumHeight(80)
-            content_widget.setStyleSheet(f"""
-                QTextEdit {{ background-color: {COLORS['bg_primary']}; border: 1px solid {COLORS['border']};
-                    border-radius: 6px; padding: 8px; color: {COLORS['text_primary']}; }}
-            """)
-            element_layout.addWidget(content_widget, stretch=1)
-        else:
-            media_container = QFrame()
-            media_container.setStyleSheet(f"""
-                QFrame {{ background-color: {COLORS['bg_primary']};
-                    border: 2px {'solid' if content else 'dashed'} {COLORS['border']}; border-radius: 6px; padding: 8px; }}
-                QFrame:hover {{ border: 2px solid {COLORS['accent_blue']}; }}
-            """)
-            media_layout = QHBoxLayout(media_container)
-            media_layout.setContentsMargins(8, 8, 8, 8)
-            if content:
-                file_label = QLabel(f"✓ {os.path.basename(str(content))}")
-                file_label.setStyleSheet(f"color: {COLORS['accent_green']};")
-                media_layout.addWidget(file_label)
-            else:
-                upload_label = QLabel(f"📁 Click to upload {element_type} or drag & drop")
-                upload_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
-                media_layout.addWidget(upload_label)
-                media_container.mousePressEvent = lambda _, t=element_type, e=element_id: self.select_media_file(t, e)
-            content_widget = media_container
-            element_layout.addWidget(media_container, stretch=1)
-
-        remove_btn = QPushButton("×")
-        remove_btn.setFixedSize(24, 24)
-        remove_btn.setStyleSheet(f"""
-            QPushButton {{ background: transparent; border: none; color: {COLORS['text_muted']}; font-size: 16px; }}
-            QPushButton:hover {{ color: {COLORS['accent_red']}; }}
-        """)
-        remove_btn.clicked.connect(lambda _, w=element_widget, e=element_id: self.remove_element(w, e))
-        element_layout.addWidget(remove_btn)
-
-        self.builder_elements.append({
-            'id': element_id, 'type': element_type,
-            'widget': content_widget, 'content': content, 'is_existing': is_existing,
-        })
-        self.canvas_layout.addWidget(element_widget)
-        self.update_count()
-
-    def select_media_file(self, media_type, element_id):
-        filters = {
-            'photo': "Images (*.png *.jpg *.jpeg *.gif *.webp)",
-            'video': "Videos (*.mp4 *.avi *.mov *.mkv *.webm)",
-            'audio': "Audio (*.mp3 *.ogg *.wav *.flac *.m4a)",
-            'document': "All Files (*)",
-        }
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, f"Select {media_type.capitalize()} File", "",
-            filters.get(media_type, "All Files (*)"))
-        if file_path:
-            for el in self.builder_elements:
-                if el['id'] == element_id:
-                    el['content'] = file_path
-                    el['is_existing'] = False
-                    container = el['widget']
-                    while container.layout().count():
-                        item = container.layout().takeAt(0)
-                        if item.widget():
-                            item.widget().deleteLater()
-                    file_label = QLabel(f"✓ {os.path.basename(file_path)}")
-                    file_label.setStyleSheet(f"color: {COLORS['accent_green']};")
-                    container.layout().addWidget(file_label)
-                    break
-            toast_success(f"Selected: {os.path.basename(file_path)}")
-
-    def remove_element(self, widget, element_id):
-        widget.deleteLater()
-        self.builder_elements = [e for e in self.builder_elements if e['id'] != element_id]
-        if not self.builder_elements and self.empty_label:
-            self.empty_label.show()
-        self.update_count()
-
-    def update_count(self):
-        count = len(self.builder_elements)
-        self.elements_count.setText(f"{count} element{'s' if count != 1 else ''}")
-
-    def save_template(self):
-        template_name = self.name_input.text().strip()
-        if not template_name:
-            toast_error("Please enter a template name")
-            return
-        if not self.builder_elements:
-            toast_error("Please add at least one element")
-            return
-
-        self.save_btn.setEnabled(False)
-        self.save_btn.setText("Saving...")
-
-        try:
-            combined_text = ""
-            media_path = ""
-            media_type = ""
-
-            for el in self.builder_elements:
-                if el['type'] == 'text':
-                    text_content = el['widget'].toPlainText().strip()
-                    if text_content:
-                        combined_text = (combined_text + "\n" + text_content).strip()
-                elif el['type'] in ('photo', 'video', 'audio', 'document'):
-                    content = el['content']
-                    if content and not media_path:
-                        if isinstance(content, str) and os.path.exists(content):
-                            # FIX 4: was HTTP POST to /templates/upload using undefined API_BASE_URL
-                            # Now uses data_service.save_media() directly
-                            try:
-                                saved = data_service.save_media(content)
-                                media_path = saved
-                                media_type = el['type']
-                            except Exception as upload_err:
-                                toast_error(f"Failed to save media: {upload_err}")
-                                return
-                        elif el.get('is_existing'):
-                            media_path = content
-                            media_type = el['type']
-
-            payload = {
-                "name": template_name,
-                "text": combined_text,
-                "media_path": media_path or None,
-                "media_type": media_type or None,
-            }
-            if self.editing_template:
-                self.data.update_template(self.editing_template.id, payload)
-                toast_success("Template updated successfully!")
-            else:
-                self.data.create_template(payload)
-                toast_success("Template created successfully!")
-            self.accept()
-        except Exception as e:
-            toast_error(f"Failed to save: {str(e)}")
-        finally:
-            self.save_btn.setEnabled(True)
-            self.save_btn.setText("Update Template" if self.editing_template else "Create Template")
-
-
-
-
 class LogsPage(QWidget):
     def __init__(self):
         super().__init__()
@@ -2707,29 +2681,6 @@ class SettingsPage(QWidget):
         title.setStyleSheet(f"font-size: 32px; font-weight: bold; color: {COLORS['text_primary']}; padding-left: 12px;")
         title_layout.addWidget(title)
         title_layout.addStretch()
-        
-        # Refresh button
-        refresh_btn = QPushButton("🔄 Refresh")
-        refresh_btn.setFixedHeight(32)
-        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        refresh_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {COLORS['bg_tertiary']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 6px;
-                color: {COLORS['text_secondary']};
-                font-weight: 600; font-size: 12px;
-                padding: 0 12px;
-            }}
-            QPushButton:hover {{
-                background: {COLORS['accent_blue_dark']};
-                border-color: {COLORS['accent_blue']};
-                color: white;
-            }}
-        """)
-        refresh_btn.clicked.connect(self.fetch_settings)
-        title_layout.addWidget(refresh_btn)
-        
         layout.addWidget(title_container)
 
         api_group = QGroupBox("Telegram API Credentials")
@@ -2839,7 +2790,6 @@ class MainWindow(QMainWindow):
         self.sidebar = Sidebar(self.navigate)
         main_layout.insertWidget(0, self.sidebar)
 
-        # Toast manager enabled
         init_toast_manager(self)
         self.navigate("Dashboard")
 

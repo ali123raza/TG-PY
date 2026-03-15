@@ -1,21 +1,17 @@
-# TG-PY Unified Application Requirements
-# Backend + Frontend combined with direct service calls
+# TG-PY Requirements — cleaned up
 
 # Database
 sqlalchemy[asyncio]>=2.0.0
 aiosqlite>=0.19.0
 
-# Telegram Client
+# Telegram Client (NO tgcrypto — pure Python, works without C extension)
 pyrogram>=2.0.0
-tgcrypto>=1.2.5
 
 # PyQt6 GUI
 PyQt6>=6.4.0
-PyQt6-Qt6>=6.4.0
 
-# Async support
-asyncio-mqtt>=0.13.0
+# Scheduler (used in services/scheduler.py)
+apscheduler>=3.10.0
 
 # Utilities
-aiofiles>=23.0.0
 python-dotenv>=1.0.0

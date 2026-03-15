@@ -17,7 +17,7 @@ async def run():
     # Import ALL models so Base knows about them
     from core.models import (
         Account, Proxy, Campaign, MessageTemplate,
-        TemplateVariant, TemplateCategory,
+        TemplateVariant, TemplateCategory, TemplateMedia,
         Peer, Contact,
         FailedMessage, Log,
     )

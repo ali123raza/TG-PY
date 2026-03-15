@@ -257,33 +257,99 @@ class TemplateBuilderDialog(QDialog):
         text_layout.addStretch()
         tabs.addTab(text_tab, "✉  Message")
 
-        # ── Tab 2: Media ──────────────────────────────────────────────────────
+        # ── Tab 2: Media (multi-file) ─────────────────────────────────────────
         media_tab = QWidget()
         media_layout = QVBoxLayout(media_tab)
         media_layout.setSpacing(10)
         media_layout.setContentsMargins(12, 12, 12, 12)
 
-        self.media_path_label = QLabel("No media attached")
-        self.media_path_label.setStyleSheet(
-            f"color: {COLORS['text_muted']}; font-size: 13px;")
-        media_layout.addWidget(self.media_path_label)
+        # Header info
+        media_hint = QLabel(
+            "📎  Add multiple files — all sent as media group. Caption on first file.")
+        media_hint.setStyleSheet(
+            f"color: {COLORS['text_secondary']}; font-size: 12px; "
+            f"background: {COLORS['bg_primary']}; border-radius: 6px; padding: 8px;")
+        media_layout.addWidget(media_hint)
 
-        media_btn_row = QHBoxLayout()
-        choose_media = QPushButton("📁  Choose File")
-        choose_media.clicked.connect(self._choose_media)
-        media_btn_row.addWidget(choose_media)
-        clear_media = QPushButton("✕  Remove Media")
-        clear_media.clicked.connect(self._clear_media)
-        media_btn_row.addWidget(clear_media)
-        media_btn_row.addStretch()
-        media_layout.addLayout(media_btn_row)
+        # Add file button
+        add_media_row = QHBoxLayout()
+        add_file_btn = QPushButton("➕  Add Media File")
+        add_file_btn.setFixedHeight(32)
+        add_file_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_file_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['gradient_blue']};
+                border: none; border-radius: 8px;
+                color: white; font-weight: 600; font-size: 12px;
+                padding: 0 16px;
+            }}
+            QPushButton:hover {{
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #79B8FF,stop:1 #388BFD);
+            }}
+        """)
+        add_file_btn.clicked.connect(self._add_media_file)
+        add_media_row.addWidget(add_file_btn)
+        clear_all_btn = QPushButton("🗑  Clear All")
+        clear_all_btn.setFixedHeight(32)
+        clear_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        clear_all_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['bg_tertiary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px; color: {COLORS['accent_red']};
+                font-size: 12px; padding: 0 12px;
+            }}
+            QPushButton:hover {{ background: {COLORS['bg_hover']}; }}
+        """)
+        clear_all_btn.clicked.connect(self._clear_all_media)
+        add_media_row.addWidget(clear_all_btn)
+        add_media_row.addStretch()
+        media_layout.addLayout(add_media_row)
 
-        self.media_type_combo = QComboBox()
-        self.media_type_combo.addItems(["photo", "video", "audio", "document"])
-        media_layout.addWidget(QLabel("Media Type (auto-detected if left as photo):"))
-        media_layout.addWidget(self.media_type_combo)
+        # Media list widget
+        self.media_list_widget = QListWidget()
+        self.media_list_widget.setMinimumHeight(200)
+        self.media_list_widget.setStyleSheet(f"""
+            QListWidget {{
+                background: {COLORS['bg_primary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 10px; padding: 6px;
+            }}
+            QListWidget::item {{
+                padding: 8px 12px; border-radius: 6px;
+                color: {COLORS['text_primary']}; margin: 2px 0;
+            }}
+            QListWidget::item:selected {{
+                background: rgba(31,111,235,0.2);
+            }}
+            QListWidget::item:hover {{
+                background: {COLORS['bg_hover']};
+            }}
+        """)
+        media_layout.addWidget(self.media_list_widget)
+
+        # Remove selected button
+        remove_sel_row = QHBoxLayout()
+        remove_sel_btn = QPushButton("✕  Remove Selected")
+        remove_sel_btn.setFixedHeight(28)
+        remove_sel_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['bg_tertiary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 6px; color: {COLORS['accent_red']};
+                font-size: 12px; padding: 0 10px;
+            }}
+            QPushButton:hover {{ background: {COLORS['bg_hover']}; }}
+        """)
+        remove_sel_btn.clicked.connect(self._remove_selected_media)
+        remove_sel_row.addWidget(remove_sel_btn)
+        remove_sel_row.addStretch()
+        media_layout.addLayout(remove_sel_row)
         media_layout.addStretch()
         tabs.addTab(media_tab, "🖼  Media")
+
+        # Internal: list of dicts: {"file_path": str, "media_type": str}
+        self._media_files: list[dict] = []
 
         # ── Tab 3: Preview ────────────────────────────────────────────────────
         preview_tab = QWidget()
@@ -341,7 +407,6 @@ class TemplateBuilderDialog(QDialog):
         bottom_row.addWidget(self.save_btn)
         layout.addLayout(bottom_row)
 
-        self._media_path = ""
         self._add_variant_box()  # start with one empty variant box (hidden)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -401,31 +466,47 @@ class TemplateBuilderDialog(QDialog):
         else:
             self.main_text.insertPlainText(tag)
 
-    def _choose_media(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Choose Media File", "",
-            "Media Files (*.jpg *.jpeg *.png *.gif *.mp4 *.mov *.mp3 *.ogg *.pdf *.zip *.*);;All Files (*)")
-        if path:
-            self._media_path = path
-            self.media_path_label.setText(f"✓  {os.path.basename(path)}")
-            self.media_path_label.setStyleSheet(
-                f"color: {COLORS['accent_green']}; font-size: 13px;")
-            # Auto-detect type
+    def _add_media_file(self):
+        """Add one or more media files to the list."""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Choose Media Files", "",
+            "Media Files (*.jpg *.jpeg *.png *.gif *.webp "
+            "*.mp4 *.mov *.avi *.mkv "
+            "*.mp3 *.ogg *.wav *.m4a "
+            "*.pdf *.zip *.*);;All Files (*)")
+        for path in paths:
             ext = os.path.splitext(path)[1].lower()
             if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
-                self.media_type_combo.setCurrentText("photo")
+                mt = "photo"
             elif ext in (".mp4", ".mov", ".avi", ".mkv"):
-                self.media_type_combo.setCurrentText("video")
+                mt = "video"
             elif ext in (".mp3", ".ogg", ".wav", ".m4a"):
-                self.media_type_combo.setCurrentText("audio")
+                mt = "audio"
             else:
-                self.media_type_combo.setCurrentText("document")
+                mt = "document"
+            self._media_files.append({"file_path": path, "media_type": mt})
+            icon = {"photo": "🖼️", "video": "🎥",
+                    "audio": "🎵", "document": "📄"}.get(mt, "📎")
+            self.media_list_widget.addItem(
+                f"{icon}  {os.path.basename(path)}  [{mt}]")
+
+    def _remove_selected_media(self):
+        row = self.media_list_widget.currentRow()
+        if row >= 0:
+            self.media_list_widget.takeItem(row)
+            if row < len(self._media_files):
+                self._media_files.pop(row)
+
+    def _clear_all_media(self):
+        self._media_files.clear()
+        self.media_list_widget.clear()
+
+    # Backward compat stubs (called from _load for old templates)
+    def _choose_media(self):
+        self._add_media_file()
 
     def _clear_media(self):
-        self._media_path = ""
-        self.media_path_label.setText("No media attached")
-        self.media_path_label.setStyleSheet(
-            f"color: {COLORS['text_muted']}; font-size: 13px;")
+        self._clear_all_media()
 
     def _refresh_preview(self):
         text = self._get_active_text()
@@ -480,14 +561,23 @@ class TemplateBuilderDialog(QDialog):
         else:
             self.main_text.setPlainText(t.get("text", ""))
 
-        # Media
-        if t.get("media_path"):
-            self._media_path = t["media_path"]
-            self.media_path_label.setText(f"✓  {os.path.basename(t['media_path'])}")
-            self.media_path_label.setStyleSheet(
-                f"color: {COLORS['accent_green']}; font-size: 13px;")
-            mt = t.get("media_type", "photo")
-            self.media_type_combo.setCurrentText(mt)
+        # Media — load all media_files (new) or fallback single file
+        self._media_files = []
+        self.media_list_widget.clear()
+        media_files = t.get("media_files") or []
+        if not media_files and t.get("media_path"):
+            media_files = [{"file_path": t["media_path"],
+                            "media_type": t.get("media_type") or "photo",
+                            "order": 0}]
+        for mf in sorted(media_files, key=lambda x: x.get("order", 0)):
+            fp = mf.get("file_path", "")
+            mt = mf.get("media_type", "photo")
+            if fp:
+                self._media_files.append({"file_path": fp, "media_type": mt})
+                icon = {"photo": "🖼️", "video": "🎥",
+                        "audio": "🎵", "document": "📄"}.get(mt, "📎")
+                fname = os.path.basename(fp.replace("\\", "/"))
+                self.media_list_widget.addItem(f"{icon}  {fname}  [{mt}]")
 
     # ── Save ─────────────────────────────────────────────────────────────────
 
@@ -520,28 +610,36 @@ class TemplateBuilderDialog(QDialog):
         vars_used = re.findall(r'\{(\w+)\}', all_text)
         vars_used = list(dict.fromkeys(vars_used))   # deduplicate
 
-        # Media — save to media dir if local file
-        media_path = ""
-        media_type = self.media_type_combo.currentText()
-        if self._media_path:
-            if os.path.exists(self._media_path):
+        # Save all media files — copy new local files, keep already-saved paths
+        saved_media_files = []
+        for mf in self._media_files:
+            fp = mf["file_path"]
+            mt = mf["media_type"]
+            if fp and os.path.exists(fp):
                 try:
-                    media_path = data_service.save_media(self._media_path)
+                    saved_path = data_service.save_media(fp)
+                    saved_media_files.append({"file_path": saved_path, "media_type": mt})
                 except Exception as e:
                     toast_error(f"Media save failed: {e}")
                     return
-            else:
-                media_path = self._media_path   # already saved path
+            elif fp:
+                # Already a saved relative path
+                saved_media_files.append({"file_path": fp, "media_type": mt})
+
+        # Backward compat: set single media_path to first file
+        first_mp = saved_media_files[0]["file_path"] if saved_media_files else ""
+        first_mt = saved_media_files[0]["media_type"] if saved_media_files else ""
 
         payload = {
-            "name":          name,
-            "text":          main_text,
-            "category_id":   self.cat_combo.currentData(),
-            "use_variants":  use_variants,
-            "variants":      variants,
+            "name":           name,
+            "text":           main_text,
+            "category_id":    self.cat_combo.currentData(),
+            "use_variants":   use_variants,
+            "variants":       variants,
             "variables_used": vars_used,
-            "media_path":    media_path or None,
-            "media_type":    media_type if media_path else None,
+            "media_files":    saved_media_files,   # NEW
+            "media_path":     first_mp,            # backward compat
+            "media_type":     first_mt,
         }
 
         self.save_btn.setEnabled(False)
@@ -705,28 +803,6 @@ class TemplatesPage(QWidget):
         header.addWidget(title)
         header.addStretch()
 
-        # Refresh button
-        refresh_btn = QPushButton("🔄 Refresh")
-        refresh_btn.setFixedHeight(32)
-        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        refresh_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {COLORS['bg_tertiary']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 6px;
-                color: {COLORS['text_secondary']};
-                font-weight: 600; font-size: 12px;
-                padding: 0 12px;
-            }}
-            QPushButton:hover {{
-                background: {COLORS['accent_blue_dark']};
-                border-color: {COLORS['accent_blue']};
-                color: white;
-            }}
-        """)
-        refresh_btn.clicked.connect(self.fetch_data)
-        header.addWidget(refresh_btn)
-
         manage_cats_btn = QPushButton("📂 Categories")
         manage_cats_btn.setStyleSheet(f"""
             QPushButton {{
@@ -790,7 +866,7 @@ class TemplatesPage(QWidget):
         hh.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(4, 80)
         hh.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(5, 200)
+        self.table.setColumnWidth(5, 130)
         self.table.horizontalHeader().setStretchLastSection(False)
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
@@ -890,71 +966,60 @@ class TemplatesPage(QWidget):
                                            if vars_list else COLORS['text_muted']))
             self.table.setItem(row, 3, vars_item)
 
-            # Media
-            media_item = QTableWidgetItem(
-                f"✓ {t['media_type']}" if t.get("media_path") else "—")
-            media_item.setForeground(
-                QColor(COLORS['accent_green']
-                       if t.get("media_path") else COLORS['text_muted']))
+            # Media — show count from media_files list
+            mc = t.get("media_count", 0)
+            if mc == 0 and t.get("media_path"):
+                mc = 1  # backward compat
+            if mc > 0:
+                types = list(dict.fromkeys(
+                    mf.get("media_type","?")
+                    for mf in t.get("media_files", [])))
+                type_str = "/".join(types) if types else t.get("media_type","?")
+                media_label = f"✓ {mc} file{'s' if mc>1 else ''}  [{type_str}]"
+                media_color = COLORS['accent_green']
+            else:
+                media_label = "—"
+                media_color = COLORS['text_muted']
+            media_item = QTableWidgetItem(media_label)
+            media_item.setForeground(QColor(media_color))
             self.table.setItem(row, 4, media_item)
 
-            # Actions
+            # Actions — 3 icon buttons (👁 ✏ ✕)
             aw = QWidget()
             aw.setStyleSheet("background: transparent;")
             al = QHBoxLayout(aw)
-            al.setContentsMargins(4, 3, 4, 3)
-            al.setSpacing(5)
+            al.setContentsMargins(6, 4, 6, 4)
+            al.setSpacing(4)
+            al.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-            preview_btn = QPushButton("👁")
-            preview_btn.setFixedSize(30, 28)
-            preview_btn.setToolTip("Preview")
-            preview_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: {COLORS['bg_tertiary']};
-                    border: 1px solid {COLORS['border']};
-                    border-radius: 5px; color: {COLORS['text_primary']};
-                    font-size: 13px;
-                }}
-                QPushButton:hover {{ background: {COLORS['bg_hover']}; }}
-            """)
-            preview_btn.clicked.connect(
-                lambda _, tmpl=t: self._preview_template(tmpl))
-            al.addWidget(preview_btn)
+            def _mk_btn(label, bg, bg_hover, tip, slot):
+                b = QPushButton(label)
+                b.setFixedSize(32, 28)
+                b.setToolTip(tip)
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.setStyleSheet(f"""
+                    QPushButton {{
+                        background: {bg};
+                        border: none; border-radius: 6px;
+                        color: white; font-size: 13px; font-weight: bold;
+                    }}
+                    QPushButton:hover {{ background: {bg_hover}; }}
+                """)
+                b.clicked.connect(slot)
+                return b
 
-            edit_btn = QPushButton("✏")
-            edit_btn.setFixedSize(30, 28)
-            edit_btn.setToolTip("Edit")
-            edit_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #58A6FF,stop:1 #1F6FEB);
-                    border: none; border-radius: 5px;
-                    color: white; font-size: 13px;
-                }}
-                QPushButton:hover {{
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #79B8FF,stop:1 #388BFD);
-                }}
-            """)
-            edit_btn.clicked.connect(
-                lambda _, tmpl=t: self._edit_template(tmpl))
-            al.addWidget(edit_btn)
-
-            del_btn = QPushButton("✕")
-            del_btn.setFixedSize(30, 28)
-            del_btn.setToolTip("Delete")
-            del_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #F85149,stop:1 #DA3633);
-                    border: none; border-radius: 5px;
-                    color: white; font-size: 13px;
-                }}
-                QPushButton:hover {{
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #FF7B72,stop:1 #F85149);
-                }}
-            """)
-            del_btn.clicked.connect(
-                lambda _, tmpl=t: self._delete_template(tmpl))
-            al.addWidget(del_btn)
-            al.addStretch()
+            al.addWidget(_mk_btn("👁",
+                "#21262D", "#30363D",
+                "Preview",
+                lambda _, tmpl=t: self._preview_template(tmpl)))
+            al.addWidget(_mk_btn("✏",
+                "#1F6FEB", "#388BFD",
+                "Edit",
+                lambda _, tmpl=t: self._edit_template(tmpl)))
+            al.addWidget(_mk_btn("✕",
+                "#DA3633", "#F85149",
+                "Delete",
+                lambda _, tmpl=t: self._delete_template(tmpl)))
 
             self.table.setCellWidget(row, 5, aw)
             self.table.setRowHeight(row, 44)
@@ -972,22 +1037,123 @@ class TemplatesPage(QWidget):
             self.fetch_data()
 
     def _preview_template(self, template: dict):
+        import os
+        from PyQt6.QtGui import QPixmap
+        from core.config import BASE_DIR
+
         dlg = QDialog(self)
         dlg.setWindowTitle(f"Preview — {template['name']}")
-        dlg.setMinimumSize(440, 320)
-        dlg.setStyleSheet(f"QDialog {{ background: {COLORS['bg_secondary']}; }}")
+        dlg.setMinimumSize(500, 440)
+        dlg.setStyleSheet(f"""
+            QDialog {{ background: {COLORS['bg_secondary']}; }}
+            QLabel   {{ color: {COLORS['text_primary']}; }}
+            QPushButton {{
+                background: {COLORS['bg_tertiary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px; padding: 8px 20px;
+                color: {COLORS['text_primary']};
+            }}
+            QPushButton:hover {{ background: {COLORS['bg_hover']}; }}
+        """)
         layout = QVBoxLayout(dlg)
+        layout.setSpacing(12)
         layout.setContentsMargins(20, 20, 20, 20)
 
-        info = QLabel(
-            f"<b>{template['name']}</b>"
-            + (f"  <span style='color:{COLORS['text_muted']}'>({template['variant_count']} variants)</span>"
-               if template.get("use_variants") else ""))
-        info.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 14px;")
-        layout.addWidget(info)
+        # ── Header ────────────────────────────────────────────────────────────
+        name_lbl = QLabel(f"<b>{template['name']}</b>")
+        name_lbl.setStyleSheet(
+            f"color: {COLORS['text_primary']}; font-size: 16px;")
+        layout.addWidget(name_lbl)
+
+        # ── Meta row ──────────────────────────────────────────────────────────
+        meta_row = QHBoxLayout()
+        if template.get("use_variants") and template.get("variant_count", 0) > 0:
+            vc_lbl = QLabel(f"🔀  {template['variant_count']} variants  (random rotation)")
+            vc_lbl.setStyleSheet(
+                f"color: {COLORS['accent_purple']}; font-size: 12px;")
+            meta_row.addWidget(vc_lbl)
+        if template.get("variables_used"):
+            vars_str = "  ".join(f"{{{v}}}" for v in template["variables_used"])
+            vv_lbl = QLabel(f"📌  {vars_str}")
+            vv_lbl.setStyleSheet(
+                f"color: {COLORS['accent_blue']}; font-size: 12px;")
+            meta_row.addWidget(vv_lbl)
+        meta_row.addStretch()
+        layout.addLayout(meta_row)
+
+        # ── Media preview ─────────────────────────────────────────────────────
+        # Build media list (new multi-file system + backward compat)
+        media_files = template.get("media_files") or []
+        if not media_files and template.get("media_path"):
+            media_files = [{"file_path": template["media_path"],
+                            "media_type": template.get("media_type","photo")}]
+
+        if media_files:
+            type_icons = {"photo":"🖼️","video":"🎥","audio":"🎵","document":"📄"}
+
+            for idx, mf in enumerate(media_files):
+                fp = mf.get("file_path","")
+                mt = mf.get("media_type","photo")
+                abs_path = (str(BASE_DIR / fp)
+                            if fp and not os.path.isabs(fp) else fp)
+
+                media_frame = QFrame()
+                media_frame.setStyleSheet(f"""
+                    QFrame {{
+                        background: {COLORS['bg_primary']};
+                        border: 1px solid {COLORS['border']};
+                        border-radius: 10px;
+                    }}
+                """)
+                mfl = QVBoxLayout(media_frame)
+                mfl.setContentsMargins(12, 10, 12, 10)
+                mfl.setSpacing(6)
+
+                icon  = type_icons.get(mt, "📎")
+                fname = os.path.basename(abs_path) if abs_path else fp
+                hdr   = QLabel(
+                    f"{icon}  <b>{mt.upper()}</b>  ·  {fname}"
+                    + (f"  <span style='color:{COLORS['text_muted']}'>"
+                       f"(file {idx+1}/{len(media_files)})</span>"
+                       if len(media_files) > 1 else ""))
+                hdr.setStyleSheet(
+                    f"color: {COLORS['accent_green']}; font-size: 13px;")
+                mfl.addWidget(hdr)
+
+                if mt == "photo" and abs_path and os.path.exists(abs_path):
+                    thumb = QLabel()
+                    pix = QPixmap(abs_path)
+                    if not pix.isNull():
+                        pix = pix.scaled(400, 200,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation)
+                        thumb.setPixmap(pix)
+                        thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                        mfl.addWidget(thumb)
+                elif abs_path and os.path.exists(abs_path):
+                    try:
+                        sz = os.path.getsize(abs_path)
+                        sz_str = (f"{sz/1024/1024:.1f} MB"
+                                  if sz > 1024*1024 else f"{sz/1024:.0f} KB")
+                        mfl.addWidget(QLabel(f"Size: {sz_str}"))
+                    except Exception:
+                        pass
+                else:
+                    w = QLabel(f"⚠  File not found: {abs_path or fp}")
+                    w.setStyleSheet(f"color:{COLORS['accent_yellow']};font-size:12px;")
+                    mfl.addWidget(w)
+
+                layout.addWidget(media_frame)
+
+        # ── Text preview ──────────────────────────────────────────────────────
+        text_lbl = QLabel("Message Text:")
+        text_lbl.setStyleSheet(
+            f"color: {COLORS['text_secondary']}; font-size: 12px;")
+        layout.addWidget(text_lbl)
 
         preview_box = QTextEdit()
         preview_box.setReadOnly(True)
+        preview_box.setMinimumHeight(120)
         preview_box.setStyleSheet(f"""
             QTextEdit {{
                 background: {COLORS['bg_primary']};
@@ -998,7 +1164,7 @@ class TemplatesPage(QWidget):
         """)
         try:
             text = self.data.preview_template(template["id"])
-            preview_box.setPlainText(text or "(empty)")
+            preview_box.setPlainText(text or "(empty — no text in this template)")
         except Exception:
             preview_box.setPlainText(template.get("text", "(empty)"))
         layout.addWidget(preview_box)

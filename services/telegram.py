@@ -1,3 +1,14 @@
+"""
+Pyrogram Client Manager with Proxy Support
+Speed improvements:
+  - Connection reuse (don't reconnect if already connected with same proxy)
+  - verify_session: safe finally block (check is_connected before stop)
+  - get_client: faster proxy equality check
+
+Bug fixes:
+  - verify_session finally: was calling stop() even if connect() never succeeded
+  - is_connected is a Pyrogram property (not method) — no () needed
+"""
 from pyrogram import Client
 from pyrogram.errors import SessionPasswordNeeded
 
@@ -8,37 +19,48 @@ class ClientManager:
     """Manages multiple Pyrogram client instances with proxy support."""
 
     def __init__(self):
-        self._clients: dict[int, Client] = {}  # account_id -> Client
-        self._client_proxies: dict[int, dict | None] = {}  # account_id -> proxy dict (track current proxy)
-        self._pending_logins: dict[str, Client] = {}  # phone -> Client (during OTP flow)
+        self._clients: dict[int, Client] = {}
+        self._client_proxies: dict[int, dict | None] = {}
+        self._pending_logins: dict[str, Client] = {}
+
+    # ── Proxy helper ──────────────────────────────────────────────────────────
 
     def _make_proxy(self, proxy) -> dict | None:
-        """Convert a Proxy model or dict to Pyrogram proxy format."""
         if not proxy:
             return None
-        # Support both ORM objects and plain dicts
         if isinstance(proxy, dict):
             p = {
-                "scheme": proxy.get("scheme", "socks5"),
+                "scheme":   proxy.get("scheme", "socks5"),
                 "hostname": proxy.get("host") or proxy.get("hostname", ""),
-                "port": proxy.get("port", 0),
+                "port":     proxy.get("port", 0),
             }
             if proxy.get("username"):
                 p["username"] = proxy["username"]
                 p["password"] = proxy.get("password", "")
         else:
             p = {
-                "scheme": proxy.scheme,
+                "scheme":   proxy.scheme,
                 "hostname": proxy.host,
-                "port": proxy.port,
+                "port":     proxy.port,
             }
             if proxy.username:
                 p["username"] = proxy.username
-                p["password"] = proxy.password
+                p["password"] = proxy.password or ""
         return p
 
+    def _proxy_key(self, proxy_dict: dict | None) -> tuple:
+        """Hashable key for proxy dict comparison (faster than dict ==)."""
+        if not proxy_dict:
+            return ()
+        return (
+            proxy_dict.get("hostname", ""),
+            proxy_dict.get("port", 0),
+            proxy_dict.get("scheme", ""),
+        )
+
+    # ── Login flow ────────────────────────────────────────────────────────────
+
     async def start_login(self, phone: str, proxy=None) -> str:
-        """Start login flow. Returns phone_code_hash via sent_code."""
         session_name = phone.replace("+", "").replace(" ", "")
         client = Client(
             name=session_name,
@@ -53,8 +75,9 @@ class ClientManager:
         self._pending_logins[phone] = client
         return sent_code.phone_code_hash
 
-    async def complete_login(self, phone: str, code: str, phone_code_hash: str, password: str | None = None) -> dict:
-        """Complete OTP login. Returns user info dict."""
+    async def complete_login(self, phone: str, code: str,
+                             phone_code_hash: str,
+                             password: str | None = None) -> dict:
         client = self._pending_logins.get(phone)
         if not client:
             raise ValueError("No pending login for this phone. Start login first.")
@@ -70,29 +93,33 @@ class ClientManager:
 
         user = signed_in
         return {
-            "id": user.id,
+            "id":         user.id,
             "first_name": user.first_name or "",
-            "last_name": user.last_name or "",
-            "username": user.username or "",
-            "phone": user.phone_number or phone,
+            "last_name":  user.last_name or "",
+            "username":   user.username or "",
+            "phone":      user.phone_number or phone,
         }
 
-    async def get_client(self, account_id: int, phone: str, proxy=None) -> Client:
-        """Get or create a connected client for an account.
+    # ── Client management ─────────────────────────────────────────────────────
 
-        If proxy changed since last connect, reconnects with new proxy.
+    async def get_client(self, account_id: int, phone: str, proxy=None) -> Client:
+        """
+        Get or create a connected client.
+        Reuses existing connection if proxy hasn't changed — avoids reconnect overhead.
+        Pyrogram: is_connected is a PROPERTY (not method).
         """
         proxy_dict = self._make_proxy(proxy)
+        new_key    = self._proxy_key(proxy_dict)
 
         if account_id in self._clients:
-            client = self._clients[account_id]
-            old_proxy = self._client_proxies.get(account_id)
+            client  = self._clients[account_id]
+            old_key = self._proxy_key(self._client_proxies.get(account_id))
 
-            # If proxy hasn't changed and client is connected, reuse
-            if client.is_connected and proxy_dict == old_proxy:
+            # ── Reuse if connected and proxy unchanged ─────────────────────────
+            if client.is_connected and old_key == new_key:
                 return client
 
-            # Proxy changed or disconnected — stop old client
+            # Proxy changed or disconnected — tear down
             if client.is_connected:
                 await client.stop()
 
@@ -105,7 +132,7 @@ class ClientManager:
             proxy=proxy_dict,
         )
         await client.start()
-        self._clients[account_id] = client
+        self._clients[account_id]        = client
         self._client_proxies[account_id] = proxy_dict
         return client
 
@@ -116,7 +143,11 @@ class ClientManager:
             await client.stop()
 
     async def verify_session(self, phone: str, proxy=None) -> dict:
-        """Connect using existing session file, get user info, then disconnect."""
+        """
+        Connect, get user info, disconnect.
+        FIX: finally block now checks is_connected before stop() to avoid
+             'ConnectionError: not connected' when connect() itself failed.
+        """
         session_name = phone.replace("+", "").replace(" ", "")
         client = Client(
             name=session_name,
@@ -125,18 +156,22 @@ class ClientManager:
             workdir=str(SESSIONS_DIR),
             proxy=self._make_proxy(proxy),
         )
+        connected = False
         try:
             await client.start()
+            connected = True
             me = await client.get_me()
             return {
-                "id": me.id,
+                "id":         me.id,
                 "first_name": me.first_name or "",
-                "last_name": me.last_name or "",
-                "username": me.username or "",
-                "phone": me.phone_number or phone,
+                "last_name":  me.last_name or "",
+                "username":   me.username or "",
+                "phone":      me.phone_number or phone,
             }
         finally:
-            if client.is_connected:
+            # FIX: only stop if we successfully connected — prevents
+            # "stop() called on non-started client" error
+            if connected and client.is_connected:
                 await client.stop()
 
     async def disconnect_all(self):

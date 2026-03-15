@@ -6,7 +6,17 @@ from core.config import DATABASE_URL
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,
-    connect_args={"timeout": 60, "check_same_thread": False},
+    # SQLite performance settings
+    connect_args={
+        "timeout": 30,
+        "check_same_thread": False,
+    },
+    # Connection pool — reuse connections instead of creating new each time
+    pool_size=5,
+    max_overflow=10,
+    pool_timeout=20,
+    pool_pre_ping=True,        # verify connection before use
+    pool_recycle=3600,         # recycle after 1 hour
 )
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
@@ -17,7 +27,7 @@ class Base(DeclarativeBase):
 
 async def init_db():
     from core.models import (Account, Proxy, Campaign, MessageTemplate,
-                              TemplateVariant, TemplateCategory,
+                              TemplateVariant, TemplateCategory, TemplateMedia,
                               Peer, Contact, FailedMessage, Log)
     from sqlalchemy import text
 

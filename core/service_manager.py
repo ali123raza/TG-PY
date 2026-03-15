@@ -2,6 +2,7 @@
 Unified Service Manager - Direct access to backend services from UI
 """
 import asyncio
+import os
 import logging
 import random
 import re
@@ -19,7 +20,7 @@ from sqlalchemy.orm import selectinload
 from core.config import SESSIONS_DIR, BASE_DIR, MEDIA_DIR, TGDATA_DIR
 from core.database import async_session, init_db
 from core.models import (Account, Proxy, Campaign, MessageTemplate,
-                         TemplateVariant, TemplateCategory,
+                         TemplateVariant, TemplateCategory, TemplateMedia,
                          Peer, Contact, Log, FailedMessage)
 from services.telegram import client_manager
 from services.tdata_import import import_tdata_accounts as _import_tdata_accounts
@@ -391,25 +392,6 @@ class ServiceManager:
                 return None
         return None
 
-    async def get_working_proxy(self) -> Optional[Proxy]:
-        """Find and return first working proxy from backend, or None if none work."""
-        async with async_session() as db:
-            result = await db.execute(
-                select(Proxy).where(Proxy.is_active == True).order_by(Proxy.created_at.desc()))
-            proxies = result.scalars().all()
-
-        for proxy in proxies:
-            try:
-                import asyncio
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(proxy.host, proxy.port), timeout=5)
-                writer.close()
-                await writer.wait_closed()
-                return proxy  # Return first working proxy
-            except Exception:
-                continue  # Try next proxy
-        return None  # No working proxy found
-
     async def test_proxy(self, proxy_id: int) -> dict:
         """Try opening a TCP connection to the proxy."""
         import asyncio
@@ -504,18 +486,62 @@ class ServiceManager:
         campaign_id  = data.get("campaign_id")
 
         try:
-            # ── Resolve template ──────────────────────────────────────────────
+            # ── Resolve template (text + media) ───────────────────────────────
             template_text: Optional[str] = None
+            template_media_path: Optional[str] = None
+            template_media_type: str = ""
+
+            # template_media_files: list of (abs_path, media_type) for sending
+            template_media_files: list[tuple[str, str]] = []
+
             if template_id:
                 async with async_session() as db:
-                    tmpl = await db.get(MessageTemplate, template_id)
+                    from sqlalchemy.orm import selectinload as _sil
+                    result_t = await db.execute(
+                        select(MessageTemplate)
+                        .options(_sil(MessageTemplate.variants),
+                                 _sil(MessageTemplate.media_files))
+                        .where(MessageTemplate.id == template_id))
+                    tmpl = result_t.scalar_one_or_none()
                     if tmpl:
-                        template_text = tmpl.text
+                        template_text = _pick_template_text(tmpl, message)
+                        # Load ALL media files from template (ordered)
+                        for mf in (tmpl.media_files or []):
+                            abs_p = (str(BASE_DIR / mf.file_path)
+                                     if not os.path.isabs(mf.file_path)
+                                     else mf.file_path)
+                            if os.path.exists(abs_p):
+                                template_media_files.append((abs_p, mf.media_type or "photo"))
+                            else:
+                                logger.warning("Template media missing: %s", abs_p)
+                        # Backward compat: old single media_path column
+                        if not template_media_files and tmpl.media_path:
+                            abs_p = (str(BASE_DIR / tmpl.media_path)
+                                     if not os.path.isabs(tmpl.media_path)
+                                     else tmpl.media_path)
+                            if os.path.exists(abs_p):
+                                template_media_files.append(
+                                    (abs_p, tmpl.media_type or "photo"))
 
             if not template_text and not message:
                 job["status"] = "failed"
                 job["message"] = "No message or template provided"
                 return
+
+            # Campaign-level media (if no template media)
+            if not template_media_files:
+                raw_mp = data.get("media_path") or ""
+                raw_mt = data.get("media_type") or "photo"
+                if raw_mp:
+                    abs_p = str(BASE_DIR / raw_mp) if not os.path.isabs(raw_mp) else raw_mp
+                    if os.path.exists(abs_p):
+                        template_media_files.append((abs_p, raw_mt))
+                    else:
+                        logger.warning("Campaign media not found: %s", abs_p)
+
+            # For backward compat, keep single-file vars too
+            final_media_path = template_media_files[0][0] if template_media_files else ""
+            final_media_type = template_media_files[0][1] if template_media_files else "photo"
 
             # ── Load accounts with their OWN proxies ──────────────────────────
             async with async_session() as db:
@@ -531,25 +557,12 @@ class ServiceManager:
                 job["message"] = "No active accounts found"
                 return
 
-            # ── Auto-assign working proxy to accounts without proxy ───────────
-            working_proxy = None
-            for acc in accounts:
-                if not acc.proxy_id:
-                    if working_proxy is None:
-                        working_proxy = await self.get_working_proxy()
-                        if working_proxy:
-                            async with async_session() as db:
-                                acc.proxy_id = working_proxy.id
-                                await db.commit()
-                                logger.info("Auto-assigned proxy %s:%s to account %s",
-                                            working_proxy.host, working_proxy.port, acc.phone)
-
             # ── Connect every account using its OWN assigned proxy ────────────
             # Each entry: (Account, TelegramClient, assigned_proxy)
             # The proxy here is FIXED for this account — we never change it.
             clients: list[tuple[Account, Any, Optional[Proxy]]] = []
             for acc in accounts:
-                assigned_proxy = acc.proxy   # the proxy assigned in edit_account (or auto-assigned above)
+                assigned_proxy = acc.proxy   # the proxy assigned in edit_account
                 proxy_label = f"{assigned_proxy.host}:{assigned_proxy.port}" if assigned_proxy else "direct"
                 try:
                     client = await client_manager.get_client(
@@ -570,7 +583,6 @@ class ServiceManager:
             if not clients:
                 job["status"] = "failed"
                 job["message"] = "Could not connect any account. Check: 1) Session valid? 2) Proxy working?"
-                logger.error("Send job %s: No clients could connect. Accounts: %s", job_id, account_ids)
                 async with async_session() as db:
                     db.add(Log(level="error", category="message",
                                message=f"Send job {job_id}: no accounts could connect"))
@@ -597,7 +609,9 @@ class ServiceManager:
 
                 try:
                     from pyrogram.types import InputPhoneContact as _IPC
-                    # Build contacts list — all phones in ONE API call
+
+                    # CONFIRMED: Pyrogram InputPhoneContact.__init__(self, phone, first_name, last_name="")
+                    # kwarg is `phone=` NOT `phone_number=`
                     contacts = [
                         _IPC(
                             phone=p if p.startswith("+") else f"+{p}",
@@ -606,65 +620,47 @@ class ServiceManager:
                         )
                         for p in phone_targets
                     ]
-                    
-                    # DEBUG: Log what we're trying to import
-                    logger.info("DEBUG: Importing %d contacts: %s", len(contacts), 
-                               [c.phone for c in contacts])
-                    
                     result = await bulk_client.import_contacts(contacts)
 
-                    # DEBUG: Log what we got back
-                    logger.info("DEBUG: import_contacts returned %d users", len(result.users))
-                    
-                    # Map imported_client_id → user_id
-                    # Pyrogram returns result.users with matching order
-                    # FIX: Safely get phone_number attribute - not all User objects have it
-                    imported_ids = {}
+                    # User.phone_number attr exists in Pyrogram — build normalized lookup
+                    # map covers all formats: +923..., 923..., original input
+                    imported_ids: dict[str, int] = {}
                     for u in result.users:
-                        try:
-                            phone = getattr(u, 'phone_number', None)
-                            uid = getattr(u, 'id', None)
-                            logger.info("DEBUG: User returned - phone: %s, id: %s", phone, uid)
-                            if phone:
-                                imported_ids[phone] = uid
-                        except Exception:
-                            pass  # Skip users without phone_number
+                        pn = getattr(u, "phone_number", None)
+                        if pn:
+                            digits = pn.lstrip("+")
+                            imported_ids[digits]       = u.id
+                            imported_ids[f"+{digits}"] = u.id
+                            imported_ids[pn]           = u.id
 
-                    # DEBUG: Log what we mapped
-                    logger.info("DEBUG: imported_ids map: %s", imported_ids)
+                    logger.info("import_contacts: %d users returned, %d keys in map",
+                                len(result.users), len(imported_ids))
 
                     for p in phone_targets:
                         phone_e164 = p if p.startswith("+") else f"+{p}"
-                        # Try with + and without
-                        uid = imported_ids.get(phone_e164) or imported_ids.get(p)
+                        digits     = phone_e164.lstrip("+")
+
+                        uid = (imported_ids.get(phone_e164)
+                               or imported_ids.get(digits)
+                               or imported_ids.get(p))
+
                         if uid:
                             _resolved_map[p] = uid
-                            logger.debug("Resolved %s → %s", p, uid)
+                            logger.info("Resolved %s → user_id %s", p, uid)
                         else:
-                            # FALLBACK: If import_contacts returned users but no match,
-                            # the phone might still be valid. Try direct send.
-                            if len(result.users) > 0:
-                                # Some users returned but not our target - might be privacy setting
-                                # Fallback to trying the phone number directly
-                                _resolved_map[p] = phone_e164  # Use phone as-is for direct send
-                                logger.warning("Phone %s not in import results, trying direct send", p)
-                            else:
-                                # Truly not found
-                                _resolved_map[p] = None   # not on Telegram
-                                job["failed"] += 1
-                                async with async_session() as db:
-                                    db.add(Log(level="warn", category="message",
-                                               account_id=bulk_acc.id,
-                                               message=f"Phone {p} not on Telegram — skipped"))
-                                    await db.commit()
+                            # Not found in import result — try direct phone send
+                            # (privacy settings may hide user from import_contacts)
+                            _resolved_map[p] = phone_e164
+                            logger.warning(
+                                "Phone %s not in import result — attempting direct send", p)
+                            async with async_session() as db:
+                                db.add(Log(level="warn", category="message",
+                                           account_id=bulk_acc.id,
+                                           message=f"Phone {p} not in import result — trying direct"))
+                                await db.commit()
 
-                    resolved_count = sum(1 for v in _resolved_map.values() if v is not None)
-                    not_found = len(phone_targets) - resolved_count
-                    job["message"] = (
-                        f"Resolved {resolved_count}/{len(phone_targets)} phones"
-                        + (f", {not_found} not on Telegram" if not_found else "")
-                    )
-                    logger.info("Bulk resolved %d/%d phones", resolved_count, len(phone_targets))
+                    job["message"] = f"Attempting {len(phone_targets)} phone(s)…"
+                    logger.info("Phone resolution done: %d phones", len(phone_targets))
 
                 except ImportError:
                     # Telethon — phones passed directly, it resolves internally
@@ -742,10 +738,62 @@ class ServiceManager:
                             client = await client_manager.get_client(acc.id, acc.phone, cur_proxy)
                         elif callable(getattr(client, 'is_connected', None)) and not client.is_connected():
                             client = await client_manager.get_client(acc.id, acc.phone, cur_proxy)
-                        await client.send_message(resolved_target, text)
+
+                        # ── Send: text, single media, or media group ──────
+                        if not template_media_files:
+                            # Text only
+                            await client.send_message(
+                                chat_id=resolved_target, text=text)
+
+                        elif len(template_media_files) == 1:
+                            # Single media file
+                            abs_p, mt = template_media_files[0]
+                            mt = mt.lower()
+                            if mt == "photo":
+                                await client.send_photo(
+                                    chat_id=resolved_target,
+                                    photo=abs_p, caption=text)
+                            elif mt == "video":
+                                await client.send_video(
+                                    chat_id=resolved_target,
+                                    video=abs_p, caption=text)
+                            elif mt == "audio":
+                                await client.send_audio(
+                                    chat_id=resolved_target,
+                                    audio=abs_p, caption=text)
+                            else:
+                                await client.send_document(
+                                    chat_id=resolved_target,
+                                    document=abs_p, caption=text)
+
+                        else:
+                            # Multiple media files → send_media_group
+                            # Caption goes on first item only
+                            from pyrogram.types import (
+                                InputMediaPhoto, InputMediaVideo,
+                                InputMediaDocument, InputMediaAudio,
+                            )
+                            media_group = []
+                            for idx, (abs_p, mt) in enumerate(template_media_files):
+                                cap = text if idx == 0 else ""
+                                mt  = mt.lower()
+                                if mt == "photo":
+                                    media_group.append(
+                                        InputMediaPhoto(abs_p, caption=cap))
+                                elif mt == "video":
+                                    media_group.append(
+                                        InputMediaVideo(abs_p, caption=cap))
+                                elif mt == "audio":
+                                    media_group.append(
+                                        InputMediaAudio(abs_p, caption=cap))
+                                else:
+                                    media_group.append(
+                                        InputMediaDocument(abs_p, caption=cap))
+                            await client.send_media_group(
+                                chat_id=resolved_target,
+                                media=media_group)
+
                         sent_ok = True
-                        # NOTE: media sending (send_photo/video/audio) goes here
-                        # when media_path is provided — handled by campaign runner
                         job["sent"] += 1
                         account_counts[acc.id] += 1
                         async with async_session() as db:
@@ -820,12 +868,9 @@ class ServiceManager:
 
                 if not sent_ok:
                     job["failed"] += 1
-                    # Get the actual error from the last attempt
-                    last_error = "failed after retries"
                     failed_targets.append({"target": target,
-                                           "error": last_error,
+                                           "error": "failed after retries",
                                            "message_text": text})
-                    logger.error("Failed to send to %s after 3 retries", target)
 
                 if i < len(targets) - 1 and not job.get("cancelled"):
                     await asyncio.sleep(random.uniform(delay_min, delay_max))
@@ -873,16 +918,17 @@ class ServiceManager:
 
     async def create_campaign(self, data: dict) -> dict:
         async with async_session() as db:
-            import json
             c = Campaign(
                 name=data["name"],
                 message_text=data.get("message_text", ""),
-                account_ids=json.dumps(data.get("account_ids", [])),
-                targets=json.dumps(data.get("targets", [])),
+                account_ids=_json.dumps(data.get("account_ids", [])),
+                targets=_json.dumps(data.get("targets", [])),
+                peer_ids=_json.dumps(data.get("peer_ids", [])),
+                template_id=data.get("template_id"),
                 status="draft",
                 delay_min=data.get("delay_min", 30),
                 delay_max=data.get("delay_max", 60),
-                max_per_account=data.get("max_per_account", 50),
+                max_per_account=data.get("max_per_account", 0),
                 media_path=data.get("media_path", ""),
                 media_type=data.get("media_type", ""),
                 rotate_accounts=data.get("rotate_accounts", True),
@@ -901,43 +947,88 @@ class ServiceManager:
                 raise Exception("Campaign not found")
             for field in ("name", "message_text", "targets", "status",
                           "delay_min", "delay_max", "max_per_account",
-                          "media_path", "media_type"):
-                if field in data:
+                          "media_path", "media_type", "template_id",
+                          "rotate_accounts", "auto_retry"):
+                if field in data and data[field] is not None:
                     setattr(c, field, data[field])
+            # JSON list fields
+            if "account_ids" in data:
+                c.account_ids = (_json.dumps(data["account_ids"])
+                                 if isinstance(data["account_ids"], list)
+                                 else data["account_ids"])
+            if "peer_ids" in data:
+                c.peer_ids = (_json.dumps(data["peer_ids"])
+                              if isinstance(data["peer_ids"], list)
+                              else data["peer_ids"])
             await db.commit()
             await db.refresh(c)
             await self._notify("campaign_updated", {"id": c.id})
             return self._ser_campaign(c)
 
     async def run_campaign(self, campaign_id: int) -> dict:
-        """Start a campaign as a send job and return job info."""
-        import json
+        """
+        Start a campaign as a send job.
+
+        Target resolution order:
+          1. peer_ids → fetch all contact values from those peers
+          2. targets  → manually saved targets list
+          Fails clearly if neither is set.
+        """
         async with async_session() as db:
             c = await db.get(Campaign, campaign_id)
             if not c:
                 raise Exception("Campaign not found")
+
             account_ids = self._safe_json(c.account_ids)
-            targets     = self._safe_json(c.targets)
-            if not account_ids or not targets:
-                raise Exception("Campaign has no accounts or targets configured")
+            if not account_ids:
+                raise Exception("Campaign has no accounts configured. Edit the campaign and select accounts.")
+
+            # ── Resolve targets ───────────────────────────────────────────────
+            targets: list[str] = []
+
+            # 1. From peers (peer_ids column)
+            peer_ids = self._safe_json(c.peer_ids)
+            if peer_ids:
+                for pid in peer_ids:
+                    peer_targets = await self.get_peer_targets(pid)
+                    targets.extend(peer_targets)
+                targets = list(dict.fromkeys(targets))  # deduplicate
+                logger.info("Campaign %s: loaded %d targets from %d peer(s)",
+                            campaign_id, len(targets), len(peer_ids))
+
+            # 2. Fallback: manual targets stored in campaign
+            if not targets:
+                targets = self._safe_json(c.targets)
+
+            if not targets:
+                raise Exception("Campaign has no targets. Add targets manually or assign a Peer in campaign settings.")
+
+            # Check message/template
+            if not c.message_text and not c.template_id:
+                raise Exception("Campaign has no message or template. Edit the campaign and add a message.")
+
             c.status = "running"
             await db.commit()
+
+        logger.info("Campaign %s starting: %d accounts, %d targets",
+                    campaign_id, len(account_ids), len(targets))
 
         result = await self.send_messages({
             "account_ids":     account_ids,
             "targets":         targets,
             "message":         c.message_text or "",
             "template_id":     c.template_id,
+            "media_path":      c.media_path or "",
+            "media_type":      c.media_type or "photo",
             "delay_min":       c.delay_min,
             "delay_max":       c.delay_max,
             "mode":            "round_robin",
             "max_per_account": c.max_per_account,
-            "rotate_proxies":  False,  # each account uses its own assigned proxy
+            "rotate_proxies":  False,
             "auto_retry":      c.auto_retry,
             "campaign_id":     campaign_id,
         })
 
-        # When the job completes, update campaign status
         job_id = result["job_id"]
         asyncio.create_task(self._watch_campaign_job(campaign_id, job_id))
         return result
@@ -967,77 +1058,29 @@ class ServiceManager:
             return True
 
     def _ser_campaign(self, c: Campaign) -> dict:
-        import json
         return {
-            "id": c.id, "name": c.name,
-            "message_text": c.message_text or "",
-            "account_ids": self._safe_json(c.account_ids),
-            "targets": self._safe_json(c.targets),
-            "status": c.status or "draft",
-            "delay_min": c.delay_min or 30,
-            "delay_max": c.delay_max or 60,
-            "max_per_account": c.max_per_account or 50,
-            "media_path": c.media_path or "",
-            "media_type": c.media_type or "",
-            "rotate_accounts": c.rotate_accounts,
-            "auto_retry": c.auto_retry,
-            "retry_count": c.retry_count or 0,
-            "max_retries": c.max_retries or 3,
-            "schedule_cron": c.schedule_cron or "",
-            "created_at": c.created_at.isoformat() if c.created_at else None,
+            "id":              c.id,
+            "name":            c.name,
+            "message_text":    c.message_text or "",
+            "account_ids":     self._safe_json(c.account_ids),
+            "targets":         self._safe_json(c.targets),
+            "peer_ids":        self._safe_json(getattr(c, "peer_ids", "[]")),
+            "template_id":     c.template_id,
+            "status":          c.status or "draft",
+            "delay_min":       c.delay_min or 30,
+            "delay_max":       c.delay_max or 60,
+            "max_per_account": c.max_per_account or 0,
+            "media_path":      c.media_path or "",
+            "media_type":      c.media_type or "",
+            "rotate_accounts": bool(c.rotate_accounts),
+            "auto_retry":      bool(c.auto_retry),
+            "retry_count":     c.retry_count or 0,
+            "max_retries":     c.max_retries or 3,
+            "schedule_cron":   c.schedule_cron or "",
+            "created_at":      c.created_at.isoformat() if c.created_at else None,
         }
 
-    # ── Templates ─────────────────────────────────────────────────────────────
-
-    async def get_templates(self) -> List[dict]:
-        async with async_session() as db:
-            result = await db.execute(
-                select(MessageTemplate).order_by(MessageTemplate.created_at.desc()))
-            return [self._ser_template(t) for t in result.scalars().all()]
-
-    async def create_template(self, data: dict) -> dict:
-        async with async_session() as db:
-            t = MessageTemplate(
-                name=data["name"],
-                text=data.get("text", ""),
-                media_path=data.get("media_path") or "",
-                media_type=data.get("media_type") or "",
-            )
-            db.add(t)
-            await db.commit()
-            await db.refresh(t)
-            return self._ser_template(t)
-
-    async def update_template(self, template_id: int, data: dict) -> dict:
-        async with async_session() as db:
-            t = await db.get(MessageTemplate, template_id)
-            if not t:
-                raise Exception("Template not found")
-            for field in ("name", "text", "media_path", "media_type"):
-                if field in data and data[field] is not None:
-                    setattr(t, field, data[field])
-            await db.commit()
-            await db.refresh(t)
-            return self._ser_template(t)
-
-    async def delete_template(self, template_id: int) -> bool:
-        async with async_session() as db:
-            t = await db.get(MessageTemplate, template_id)
-            if not t:
-                raise Exception("Template not found")
-            if t.media_path:
-                p = MEDIA_DIR / t.media_path
-                if p.exists():
-                    p.unlink()
-            await db.delete(t)
-            await db.commit()
-            return True
-
-    def _ser_template(self, t: MessageTemplate) -> dict:
-        return {"id": t.id, "name": t.name, "text": t.text or "",
-                "media_path": t.media_path or "", "media_type": t.media_type or "",
-                "created_at": t.created_at.isoformat() if t.created_at else None}
-
+    # ── Templates — see full implementation below (with variants/categories) ──────
     # ── Scraper ───────────────────────────────────────────────────────────────
 
     async def scrape_members(self, account_id: int, group: str,
@@ -1134,40 +1177,53 @@ class ServiceManager:
 
     async def get_stats(self) -> dict:
         async with async_session() as db:
-            total_accounts  = await db.scalar(select(func.count(Account.id))) or 0
-            active_accounts = await db.scalar(
-                select(func.count(Account.id)).where(Account.is_active == True)) or 0
-            total_sent      = await db.scalar(select(func.sum(Account.messages_sent))) or 0
-            total_campaigns = await db.scalar(select(func.count(Campaign.id))) or 0
-            total_proxies   = await db.scalar(select(func.count(Proxy.id))) or 0
-            total_templates = await db.scalar(select(func.count(MessageTemplate.id))) or 0
+            # Run all counts in parallel using asyncio.gather
+            import asyncio as _aio
+
+            (total_accounts, active_accounts, total_sent,
+             total_campaigns, total_proxies, total_templates) = await _aio.gather(
+                db.scalar(select(func.count(Account.id))),
+                db.scalar(select(func.count(Account.id)).where(Account.is_active == True)),
+                db.scalar(select(func.sum(Account.messages_sent))),
+                db.scalar(select(func.count(Campaign.id))),
+                db.scalar(select(func.count(Proxy.id))),
+                db.scalar(select(func.count(MessageTemplate.id))),
+            )
+            total_accounts  = total_accounts  or 0
+            active_accounts = active_accounts or 0
+            total_sent      = total_sent      or 0
+            total_campaigns = total_campaigns or 0
+            total_proxies   = total_proxies   or 0
+            total_templates = total_templates or 0
 
             camp_result = await db.execute(
                 select(Campaign.status, func.count(Campaign.id)).group_by(Campaign.status))
             campaign_by_status = {s: c for s, c in camp_result.all()}
 
-            per_account = []
-            for acc in (await db.execute(select(Account))).scalars().all():
-                per_account.append({
-                    "id": acc.id, "name": acc.name or acc.phone,
-                    "phone": acc.phone, "sent": acc.messages_sent or 0, "failed": 0,
-                })
-
-            logs_result = await db.execute(
-                select(Log).order_by(Log.created_at.desc()).limit(50))
+            # Per-account + recent logs in one round
+            accs_res, logs_res = await _aio.gather(
+                db.execute(select(Account.id, Account.name, Account.phone,
+                                  Account.messages_sent)
+                           .order_by(Account.created_at.desc())),
+                db.execute(select(Log).order_by(Log.created_at.desc()).limit(50)),
+            )
+            per_account = [
+                {"id": r.id, "name": r.name or r.phone,
+                 "phone": r.phone, "sent": r.messages_sent or 0, "failed": 0}
+                for r in accs_res.all()
+            ]
             recent_logs = [
                 {"id": l.id, "category": l.category or "general",
                  "level": l.level or "info", "message": l.message or "",
                  "created_at": l.created_at.isoformat() if l.created_at else None}
-                for l in logs_result.scalars().all()
+                for l in logs_res.scalars().all()
             ]
 
-            total_msgs = total_sent
-            success_rate = "100%" if total_msgs > 0 else "0%"
+            success_rate = "100%" if total_sent > 0 else "0%"
 
             return {
                 "accounts": {"total": total_accounts, "active": active_accounts},
-                "messages": {"sent": total_sent, "failed": 0, "total": total_msgs},
+                "messages": {"sent": total_sent, "failed": 0, "total": total_sent},
                 "success_rate": success_rate,
                 "campaigns": {"total": total_campaigns, "by_status": campaign_by_status},
                 "proxies": total_proxies,
@@ -1223,14 +1279,20 @@ class ServiceManager:
     # ── Media ─────────────────────────────────────────────────────────────────
 
     async def save_media(self, file_path: str) -> str:
-        src = Path(file_path)
-        if not src.exists():
-            raise Exception("File not found")
+        """
+        Copy media file to MEDIA_DIR.
+        Returns path relative to BASE_DIR (e.g. "media/abc123.jpg").
+        UI can resolve to absolute with: BASE_DIR / returned_path
+        """
+        src_p = Path(file_path)
+        if not src_p.exists():
+            raise Exception(f"File not found: {file_path}")
         MEDIA_DIR.mkdir(exist_ok=True)
-        filename = f"{uuid.uuid4().hex}{src.suffix.lower()}"
+        filename = f"{uuid.uuid4().hex}{src_p.suffix.lower()}"
         dst = MEDIA_DIR / filename
-        shutil.copy2(src, dst)
-        return str(dst.relative_to(BASE_DIR))
+        shutil.copy2(src_p, dst)
+        # Return relative path stored in DB
+        return str(dst.relative_to(BASE_DIR)).replace("\\", "/")
 
 
 
@@ -1240,14 +1302,23 @@ class ServiceManager:
 
     async def get_peers(self) -> List[dict]:
         async with async_session() as db:
-            result = await db.execute(select(Peer).order_by(Peer.created_at.desc()))
-            peers = result.scalars().all()
-            out = []
-            for p in peers:
-                count = await db.scalar(
-                    select(func.count(Contact.id)).where(Contact.peer_id == p.id))
-                out.append({**self._ser_peer(p), "contact_count": count or 0})
-            return out
+            # Single query: peers + contact counts via LEFT JOIN GROUP BY
+            from sqlalchemy import outerjoin, case
+            peers_q = await db.execute(select(Peer).order_by(Peer.created_at.desc()))
+            peers = peers_q.scalars().all()
+            if not peers:
+                return []
+            # Batch count in one query
+            peer_ids = [p.id for p in peers]
+            counts_q = await db.execute(
+                select(Contact.peer_id, func.count(Contact.id).label("cnt"))
+                .where(Contact.peer_id.in_(peer_ids))
+                .group_by(Contact.peer_id)
+            )
+            count_map = {row.peer_id: row.cnt for row in counts_q.all()}
+            return [{**self._ser_peer(p),
+                     "contact_count": count_map.get(p.id, 0)}
+                    for p in peers]
 
     async def get_peer(self, peer_id: int) -> Optional[dict]:
         async with async_session() as db:
@@ -1324,15 +1395,18 @@ class ServiceManager:
             return [self._ser_contact(c) for c in result.scalars().all()]
 
     async def get_peer_contact_count(self, peer_id: int) -> dict:
-        """Returns counts per status for a peer."""
+        """Returns counts per status — single GROUP BY query."""
         async with async_session() as db:
-            statuses = ["pending", "sent", "failed", "invalid", "duplicate"]
-            counts = {}
-            for s in statuses:
-                counts[s] = await db.scalar(
-                    select(func.count(Contact.id)).where(
-                        Contact.peer_id == peer_id, Contact.status == s)) or 0
-            counts["total"] = sum(counts.values())
+            result = await db.execute(
+                select(Contact.status, func.count(Contact.id).label("cnt"))
+                .where(Contact.peer_id == peer_id)
+                .group_by(Contact.status)
+            )
+            counts = {row.status: row.cnt for row in result.all()}
+            all_statuses = ["pending", "sent", "failed", "invalid", "duplicate"]
+            for s in all_statuses:
+                counts.setdefault(s, 0)
+            counts["total"] = sum(counts[s] for s in all_statuses)
             return counts
 
     async def bulk_import_contacts(self, peer_id: int, raw_text: str,
@@ -1544,16 +1618,18 @@ class ServiceManager:
             result = await db.execute(
                 select(MessageTemplate)
                 .options(_sil(MessageTemplate.variants),
-                         _sil(MessageTemplate.category))
+                         _sil(MessageTemplate.category),
+                         _sil(MessageTemplate.media_files))
                 .order_by(MessageTemplate.created_at.desc()))
             return [self._ser_template_full(t) for t in result.scalars().all()]
 
     async def create_template(self, data: dict) -> dict:
+        from sqlalchemy.orm import selectinload as _sil
         async with async_session() as db:
             t = MessageTemplate(
                 name=data["name"],
                 text=data.get("text", ""),
-                media_path=data.get("media_path") or "",
+                media_path=data.get("media_path") or "",   # backward compat
                 media_type=data.get("media_type") or "",
                 category_id=data.get("category_id"),
                 use_variants=data.get("use_variants", False),
@@ -1562,15 +1638,33 @@ class ServiceManager:
             db.add(t)
             await db.flush()
 
-            # Add variants
+            # Text variants
             for i, vtext in enumerate(data.get("variants", [])):
                 if vtext.strip():
                     db.add(TemplateVariant(
                         template_id=t.id, text=vtext, order=i))
 
+            # Media files (new multi-media system)
+            for i, mf in enumerate(data.get("media_files", [])):
+                fp = mf.get("file_path") or mf.get("path", "")
+                mt = mf.get("media_type", "photo")
+                if fp:
+                    db.add(TemplateMedia(
+                        template_id=t.id, file_path=fp,
+                        media_type=mt, order=i))
+
             await db.commit()
-            await db.refresh(t)
-            return self._ser_template_full(t)
+            new_id = t.id
+
+        async with async_session() as db:
+            result = await db.execute(
+                select(MessageTemplate)
+                .options(_sil(MessageTemplate.variants),
+                         _sil(MessageTemplate.category),
+                         _sil(MessageTemplate.media_files))
+                .where(MessageTemplate.id == new_id))
+            t2 = result.scalar_one()
+            return self._ser_template_full(t2)
 
     async def update_template(self, template_id: int, data: dict) -> dict:
         async with async_session() as db:
@@ -1601,9 +1695,32 @@ class ServiceManager:
                         db.add(TemplateVariant(
                             template_id=t.id, text=vtext, order=i))
 
+            # Replace media files if provided
+            if "media_files" in data:
+                for mf in t.media_files:
+                    await db.delete(mf)
+                await db.flush()
+                for i, mf in enumerate(data["media_files"]):
+                    fp = mf.get("file_path") or mf.get("path", "")
+                    mt = mf.get("media_type", "photo")
+                    if fp:
+                        db.add(TemplateMedia(
+                            template_id=t.id, file_path=fp,
+                            media_type=mt, order=i))
+
             await db.commit()
-            await db.refresh(t)
-            return self._ser_template_full(t)
+            new_id = t.id
+
+        from sqlalchemy.orm import selectinload as _sil2
+        async with async_session() as db:
+            result = await db.execute(
+                select(MessageTemplate)
+                .options(_sil2(MessageTemplate.variants),
+                         _sil2(MessageTemplate.category),
+                         _sil2(MessageTemplate.media_files))
+                .where(MessageTemplate.id == new_id))
+            t2 = result.scalar_one()
+            return self._ser_template_full(t2)
 
     async def delete_template(self, template_id: int) -> bool:
         async with async_session() as db:
@@ -1652,15 +1769,31 @@ class ServiceManager:
             vars_used = _json.loads(t.variables_used) if t.variables_used else []
         except Exception:
             vars_used = []
+
+        # Build media_files list from new TemplateMedia table
+        mf_list = [
+            {"id": mf.id, "file_path": mf.file_path,
+             "media_type": mf.media_type or "photo", "order": mf.order}
+            for mf in sorted(getattr(t, "media_files", []) or [],
+                             key=lambda x: x.order)
+        ]
+        # Backward compat: show old single column if no multi-media rows
+        if not mf_list and t.media_path:
+            mf_list = [{"id": None, "file_path": t.media_path,
+                        "media_type": t.media_type or "photo", "order": 0}]
+
         return {
             "id": t.id,
             "name": t.name,
             "text": t.text or "",
-            "media_path": t.media_path or "",
+            "media_path": t.media_path or "",   # backward compat
             "media_type": t.media_type or "",
+            "media_files": mf_list,             # NEW — ordered list
+            "media_count": len(mf_list),
             "category_id": t.category_id,
-            "category": {"id": t.category.id, "name": t.category.name,
-                         "color": t.category.color} if t.category else None,
+            "category": ({"id": t.category.id, "name": t.category.name,
+                          "color": t.category.color}
+                         if t.category_id and t.category else None),
             "use_variants": t.use_variants,
             "variables_used": vars_used,
             "variants": [{"id": v.id, "text": v.text, "order": v.order}

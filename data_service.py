@@ -45,14 +45,40 @@ def _get_loop() -> asyncio.AbstractEventLoop:
     return _worker_loop
 
 
-def run_async(coro: Any, timeout: float = 120) -> Any:
-    """Submit coroutine to the worker loop and block until done."""
+def run_async(coro: Any, timeout: float = 30) -> Any:
+    """Submit coroutine to the worker loop and block until done.
+    Default timeout 30s (was 120s) — prevents frozen UI on hangs.
+    Use timeout=300 only for bulk operations like import_contacts.
+    """
     future = asyncio.run_coroutine_threadsafe(coro, _get_loop())
     try:
         return future.result(timeout=timeout)
     except concurrent.futures.TimeoutError:
         future.cancel()
-        raise TimeoutError(f"Async operation timed out after {timeout}s")
+        raise TimeoutError(f"Operation timed out after {timeout}s")
+
+
+def run_async_bg(coro: Any, callback=None, error_cb=None) -> None:
+    """
+    Fire-and-forget: submit coroutine, don't block Qt thread.
+    callback(result) called on completion (in worker thread — use signals for UI).
+    error_cb(exception) called on error.
+    """
+    loop = _get_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+
+    def _done(f):
+        try:
+            result = f.result()
+            if callback:
+                callback(result)
+        except Exception as e:
+            if error_cb:
+                error_cb(e)
+            else:
+                logger.error("run_async_bg error: %s", e)
+
+    future.add_done_callback(_done)
 
 
 # ── DataService ───────────────────────────────────────────────────────────────
@@ -230,7 +256,7 @@ class DataService(QObject):
     # ── Stats ─────────────────────────────────────────────────────────────────
 
     def get_stats(self) -> dict:
-        return run_async(service_manager.get_stats())
+        return run_async(service_manager.get_stats(), timeout=10)
 
     # ── Logs ──────────────────────────────────────────────────────────────────
 

@@ -113,6 +113,10 @@ class MessageTemplate(Base):
         back_populates="template", cascade="all, delete-orphan",
         order_by="TemplateVariant.order")
 
+    media_files: Mapped[list["TemplateMedia"]] = relationship(
+        back_populates="template", cascade="all, delete-orphan",
+        order_by="TemplateMedia.order")
+
 
 class TemplateVariant(Base):
     """
@@ -129,6 +133,24 @@ class TemplateVariant(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     template: Mapped["MessageTemplate"] = relationship(back_populates="variants")
+
+
+class TemplateMedia(Base):
+    """
+    One media file attached to a template.
+    A template can have multiple media files (sent as media group).
+    Replaces the single media_path / media_type columns.
+    """
+    __tablename__ = "template_media"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    template_id: Mapped[int] = mapped_column(ForeignKey("message_templates.id"))
+    file_path: Mapped[str] = mapped_column(String(500))   # relative to BASE_DIR
+    media_type: Mapped[str] = mapped_column(String(20), default="photo")
+    order: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    template: Mapped["MessageTemplate"] = relationship(back_populates="media_files")
 
 
 class Campaign(Base):

@@ -1,17 +1,26 @@
-# TG-PY Requirements — cleaned up
+# TG-PY Requirements
 
 # Database
 sqlalchemy[asyncio]>=2.0.0
 aiosqlite>=0.19.0
 
-# Telegram Client (NO tgcrypto — pure Python, works without C extension)
+# Telegram Client
 pyrogram>=2.0.0
+# tgcrypto  ← Optional: needs Microsoft C++ Build Tools
+#             Install separately if you want faster encryption:
+#             pip install tgcrypto
+#             OR: pip install cryptg (easier alternative)
 
 # PyQt6 GUI
 PyQt6>=6.4.0
 
-# Scheduler (used in services/scheduler.py)
+# Scheduler
 apscheduler>=3.10.0
+
+# License System
+psycopg2-binary>=2.9.0
+passlib[bcrypt]>=1.7.4
+cryptography>=41.0.0
 
 # Utilities
 python-dotenv>=1.0.0

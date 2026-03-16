@@ -45,10 +45,38 @@ def _get_loop() -> asyncio.AbstractEventLoop:
     return _worker_loop
 
 
+import time as _time
+
+# ── Simple TTL cache ──────────────────────────────────────────────────────────
+# Avoids refetching the same data multiple times per second during page redraws
+
+_cache: dict[str, tuple[float, Any]] = {}   # key → (expire_time, value)
+
+def _cache_get(key: str) -> Any:
+    """Return cached value or _MISS sentinel."""
+    entry = _cache.get(key)
+    if entry and _time.monotonic() < entry[0]:
+        return entry[1]
+    return _MISS
+
+def _cache_set(key: str, value: Any, ttl: float = 3.0):
+    _cache[key] = (_time.monotonic() + ttl, value)
+
+def _cache_clear(prefix: str = ""):
+    """Invalidate all (or prefixed) cache entries."""
+    if not prefix:
+        _cache.clear()
+    else:
+        for k in list(_cache.keys()):
+            if k.startswith(prefix):
+                del _cache[k]
+
+_MISS = object()   # sentinel
+
+
 def run_async(coro: Any, timeout: float = 30) -> Any:
-    """Submit coroutine to the worker loop and block until done.
-    Default timeout 30s (was 120s) — prevents frozen UI on hangs.
-    Use timeout=300 only for bulk operations like import_contacts.
+    """Submit coroutine to worker loop — blocks Qt thread for duration.
+    Default 30s. login_start uses 90s. Bulk ops use 300s.
     """
     future = asyncio.run_coroutine_threadsafe(coro, _get_loop())
     try:
@@ -56,6 +84,20 @@ def run_async(coro: Any, timeout: float = 30) -> Any:
     except concurrent.futures.TimeoutError:
         future.cancel()
         raise TimeoutError(f"Operation timed out after {timeout}s")
+
+
+def run_async_cached(key: str, coro_fn, ttl: float = 3.0, timeout: float = 30) -> Any:
+    """
+    Like run_async but returns cached result if still fresh.
+    coro_fn: callable that returns a coroutine (called only on cache miss).
+    ttl: seconds to keep result (default 3s — fast enough for UI, avoids refetch).
+    """
+    v = _cache_get(key)
+    if v is not _MISS:
+        return v
+    result = run_async(coro_fn(), timeout=timeout)
+    _cache_set(key, result, ttl)
+    return result
 
 
 def run_async_bg(coro: Any, callback=None, error_cb=None) -> None:
@@ -149,13 +191,14 @@ class DataService(QObject):
     # ── Accounts ──────────────────────────────────────────────────────────────
 
     def get_accounts(self) -> list:
-        return run_async(service_manager.get_accounts())
+        return run_async_cached('accounts', service_manager.get_accounts, ttl=2)
 
     def get_account(self, account_id: int) -> Optional[dict]:
         return run_async(service_manager.get_account(account_id))
 
     def login_start(self, phone: str, proxy_id: Optional[int] = None) -> dict:
-        return run_async(service_manager.login_start(phone, proxy_id))
+        # Telegram OTP send can be slow on first connect — give 90s
+        return run_async(service_manager.login_start(phone, proxy_id), timeout=90)
 
     def login_complete(self, phone: str, code: str, phone_code_hash: str,
                        password: Optional[str] = None,
@@ -164,10 +207,14 @@ class DataService(QObject):
             phone, code, phone_code_hash, password, proxy_id))
 
     def update_account(self, account_id: int, data: dict) -> dict:
-        return run_async(service_manager.update_account(account_id, data))
+        result = run_async(service_manager.update_account(account_id, data))
+        _cache_clear('accounts')
+        return result
 
     def delete_account(self, account_id: int) -> bool:
-        return run_async(service_manager.delete_account(account_id))
+        result = run_async(service_manager.delete_account(account_id))
+        _cache_clear('accounts')
+        return result
 
     def check_account_health(self, account_id: int) -> dict:
         return run_async(service_manager.check_account_health(account_id))
@@ -185,10 +232,12 @@ class DataService(QObject):
     # ── Proxies ───────────────────────────────────────────────────────────────
 
     def get_proxies(self) -> list:
-        return run_async(service_manager.get_proxies())
+        return run_async_cached('proxies', service_manager.get_proxies, ttl=10)
 
     def create_proxy(self, data: dict) -> dict:
-        return run_async(service_manager.create_proxy(data))
+        result = run_async(service_manager.create_proxy(data))
+        _cache_clear('proxies')
+        return result
 
     def bulk_create_proxies(self, text: str) -> dict:
         return run_async(service_manager.bulk_create_proxies(text))
@@ -197,7 +246,9 @@ class DataService(QObject):
         return run_async(service_manager.test_proxy(proxy_id), timeout=15)
 
     def delete_proxy(self, proxy_id: int) -> bool:
-        return run_async(service_manager.delete_proxy(proxy_id))
+        result = run_async(service_manager.delete_proxy(proxy_id))
+        _cache_clear('proxies')
+        return result
 
     # ── Messaging ─────────────────────────────────────────────────────────────
 
@@ -211,7 +262,7 @@ class DataService(QObject):
     # ── Campaigns ─────────────────────────────────────────────────────────────
 
     def get_campaigns(self) -> list:
-        return run_async(service_manager.get_campaigns())
+        return run_async_cached('campaigns', service_manager.get_campaigns, ttl=2)
 
     def get_campaign(self, campaign_id: int) -> Optional[dict]:
         return run_async(service_manager.get_campaign(campaign_id))
@@ -232,16 +283,22 @@ class DataService(QObject):
     # ── Templates ─────────────────────────────────────────────────────────────
 
     def get_templates(self) -> list:
-        return run_async(service_manager.get_templates())
+        return run_async_cached('templates', service_manager.get_templates, ttl=10)
 
     def create_template(self, data: dict) -> dict:
-        return run_async(service_manager.create_template(data))
+        result = run_async(service_manager.create_template(data))
+        _cache_clear('templates')
+        return result
 
     def update_template(self, template_id: int, data: dict) -> dict:
-        return run_async(service_manager.update_template(template_id, data))
+        result = run_async(service_manager.update_template(template_id, data))
+        _cache_clear('templates')
+        return result
 
     def delete_template(self, template_id: int) -> bool:
-        return run_async(service_manager.delete_template(template_id))
+        result = run_async(service_manager.delete_template(template_id))
+        _cache_clear('templates')
+        return result
 
     # ── Scraper ───────────────────────────────────────────────────────────────
 
@@ -301,19 +358,23 @@ class DataService(QObject):
     # ── Peers ─────────────────────────────────────────────────────────────────
 
     def get_peers(self) -> list:
-        return run_async(service_manager.get_peers())
+        return run_async_cached('peers', service_manager.get_peers, ttl=5)
 
     def get_peer(self, peer_id: int) -> Optional[dict]:
         return run_async(service_manager.get_peer(peer_id))
 
     def create_peer(self, data: dict) -> dict:
-        return run_async(service_manager.create_peer(data))
+        result = run_async(service_manager.create_peer(data))
+        _cache_clear('peers'); _cache_clear('stats')
+        return result
 
     def update_peer(self, peer_id: int, data: dict) -> dict:
         return run_async(service_manager.update_peer(peer_id, data))
 
     def delete_peer(self, peer_id: int) -> bool:
-        return run_async(service_manager.delete_peer(peer_id))
+        result = run_async(service_manager.delete_peer(peer_id))
+        _cache_clear('peers'); _cache_clear('stats')
+        return result
 
     # ── Contacts ──────────────────────────────────────────────────────────────
 
@@ -348,7 +409,7 @@ class DataService(QObject):
     # ── Template categories ───────────────────────────────────────────────────
 
     def get_template_categories(self) -> list:
-        return run_async(service_manager.get_template_categories())
+        return run_async_cached('template_cats', service_manager.get_template_categories, ttl=30)
 
     def create_template_category(self, name: str, color: str = "#3FB950") -> dict:
         return run_async(service_manager.create_template_category(name, color))
@@ -359,6 +420,15 @@ class DataService(QObject):
     def preview_template(self, template_id: int, sample_vars: dict = None) -> str:
         return run_async(service_manager.preview_template(
             template_id, sample_vars or {}))
+
+    def invalidate_all(self):
+        """Force-clear entire cache — instant fresh data on next call."""
+        _cache_clear()
+
+    def invalidate(self, *keys: str):
+        """Clear specific cache keys (e.g. 'accounts', 'campaigns')."""
+        for k in keys:
+            _cache_clear(k)
 
 # ── Singleton ─────────────────────────────────────────────────────────────────
 

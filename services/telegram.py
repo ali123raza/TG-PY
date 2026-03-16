@@ -61,6 +61,7 @@ class ClientManager:
     # ── Login flow ────────────────────────────────────────────────────────────
 
     async def start_login(self, phone: str, proxy=None) -> str:
+        import asyncio
         session_name = phone.replace("+", "").replace(" ", "")
         client = Client(
             name=session_name,
@@ -69,9 +70,27 @@ class ClientManager:
             workdir=str(SESSIONS_DIR),
             proxy=self._make_proxy(proxy),
             in_memory=False,
+            no_updates=True,       # don't receive updates during login — faster
+            sleep_threshold=0,     # don't sleep on floodwait during login
         )
-        await client.connect()
-        sent_code = await client.send_code(phone)
+        # Wrap connect + send_code in a timeout to prevent infinite retry loop
+        try:
+            await asyncio.wait_for(client.connect(), timeout=30)
+        except asyncio.TimeoutError:
+            raise Exception("Connection timed out. Check your proxy settings.")
+        except Exception as e:
+            raise Exception(f"Connection failed: {e}")
+
+        try:
+            sent_code = await asyncio.wait_for(
+                client.send_code(phone), timeout=30)
+        except asyncio.TimeoutError:
+            await client.disconnect()
+            raise Exception("Send code timed out. Telegram servers unreachable.")
+        except Exception as e:
+            await client.disconnect()
+            raise Exception(f"Failed to send code: {e}")
+
         self._pending_logins[phone] = client
         return sent_code.phone_code_hash
 
@@ -130,6 +149,8 @@ class ClientManager:
             api_hash=API_HASH,
             workdir=str(SESSIONS_DIR),
             proxy=proxy_dict,
+            no_updates=True,     # messaging accounts don't need incoming updates
+            sleep_threshold=60,  # sleep on floodwait up to 60s automatically
         )
         await client.start()
         self._clients[account_id]        = client

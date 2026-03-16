@@ -603,74 +603,77 @@ class ServiceManager:
             _resolved_map: dict[str, object] = {t: t for t in direct_targets}
 
             if phone_targets and clients:
-                # Use first available client for bulk import
+                # Use first available client for phone resolution
                 bulk_acc, bulk_client, _ = clients[0]
-                job["message"] = f"Resolving {len(phone_targets)} phone number(s)…"
+                job["message"] = f"Checking {len(phone_targets)} phone number(s) on Telegram…"
 
                 try:
                     from pyrogram.types import InputPhoneContact as _IPC
 
-                    # CONFIRMED: Pyrogram InputPhoneContact.__init__(self, phone, first_name, last_name="")
-                    # kwarg is `phone=` NOT `phone_number=`
-                    contacts = [
-                        _IPC(
-                            phone=p if p.startswith("+") else f"+{p}",
-                            first_name="User",
-                            last_name="",
-                        )
-                        for p in phone_targets
-                    ]
-                    result = await bulk_client.import_contacts(contacts)
-
-                    # User.phone_number attr exists in Pyrogram — build normalized lookup
-                    # map covers all formats: +923..., 923..., original input
-                    imported_ids: dict[str, int] = {}
-                    for u in result.users:
-                        pn = getattr(u, "phone_number", None)
-                        if pn:
-                            digits = pn.lstrip("+")
-                            imported_ids[digits]       = u.id
-                            imported_ids[f"+{digits}"] = u.id
-                            imported_ids[pn]           = u.id
-
-                    logger.info("import_contacts: %d users returned, %d keys in map",
-                                len(result.users), len(imported_ids))
+                    # Step 1: Get all existing contacts first
+                    logger.info("Fetching contacts list...")
+                    all_contacts = await bulk_client.get_contacts()
+                    
+                    # Build phone → user_id map from existing contacts
+                    contact_map: dict[str, int] = {}
+                    for contact in all_contacts:
+                        phone = getattr(contact, 'phone_number', None)
+                        if phone:
+                            digits = phone.lstrip('+').replace(' ', '')
+                            contact_map[digits] = contact.id
+                            # Also store with + prefix
+                            contact_map['+' + digits] = contact.id
+                    
+                    logger.info("Loaded %d contacts from list", len(all_contacts))
 
                     for p in phone_targets:
                         phone_e164 = p if p.startswith("+") else f"+{p}"
-                        digits     = phone_e164.lstrip("+")
-
-                        uid = (imported_ids.get(phone_e164)
-                               or imported_ids.get(digits)
-                               or imported_ids.get(p))
-
-                        if uid:
-                            _resolved_map[p] = uid
-                            logger.info("Resolved %s → user_id %s", p, uid)
+                        digits = phone_e164.lstrip("+").replace(' ', '')
+                        
+                        # Step 2: Check if number exists in contacts
+                        user_id = contact_map.get(digits) or contact_map.get(phone_e164)
+                        
+                        if user_id:
+                            # ✅ Found in existing contacts!
+                            logger.info("✅ %s found in contacts (user_id: %s)", p, user_id)
+                            _resolved_map[p] = user_id
+                            
                         else:
-                            # Not found in import result — try direct phone send
-                            # (privacy settings may hide user from import_contacts)
-                            _resolved_map[p] = phone_e164
-                            logger.warning(
-                                "Phone %s not in import result — attempting direct send", p)
-                            async with async_session() as db:
-                                db.add(Log(level="warn", category="message",
-                                           account_id=bulk_acc.id,
-                                           message=f"Phone {p} not in import result — trying direct"))
-                                await db.commit()
+                            # Not in contacts - try to import
+                            logger.info("→ %s not in contacts - attempting import...", p)
+                            try:
+                                import_result = await bulk_client.import_contacts([
+                                    _IPC(phone=phone_e164, first_name="User", last_name="")
+                                ])
+                                
+                                # Check if user was returned
+                                if import_result.users:
+                                    for u in import_result.users:
+                                        u_phone = getattr(u, 'phone_number', None)
+                                        if u_phone:
+                                            u_digits = u_phone.lstrip('+').replace(' ', '')
+                                            if u_digits == digits:
+                                                user_id = u.id
+                                                logger.info("✅ %s added via import (user_id: %s)", p, user_id)
+                                                _resolved_map[p] = user_id
+                                                break
+                                
+                                if not user_id:
+                                    # Still not found - privacy settings may block
+                                    logger.warning("❌ %s - import returned no match (privacy settings?)", p)
+                                    _resolved_map[p] = phone_e164  # Try direct send
+                                    
+                            except Exception as import_err:
+                                logger.error("❌ Error importing %s: %s", p, import_err)
+                                _resolved_map[p] = phone_e164  # Try direct send
 
-                    job["message"] = f"Attempting {len(phone_targets)} phone(s)…"
-                    logger.info("Phone resolution done: %d phones", len(phone_targets))
-
-                except ImportError:
-                    # Telethon — phones passed directly, it resolves internally
-                    for p in phone_targets:
-                        _resolved_map[p] = p if p.startswith("+") else f"+{p}"
-                    logger.info("Telethon mode — phones passed directly")
+                    job["message"] = f"Resolved {len([t for t in _resolved_map if _resolved_map[t]])} / {len(phone_targets)} phone(s)"
+                    logger.info("Phone resolution complete: %d to attempt", 
+                               len([t for t in _resolved_map if _resolved_map[t]]))
 
                 except Exception as bulk_err:
-                    # Bulk import failed — fall back to direct phone passing
-                    logger.warning("Bulk contact import failed: %s — using phones directly", bulk_err)
+                    logger.error("Phone resolution failed: %s", bulk_err)
+                    # Fallback: try direct send for all
                     for p in phone_targets:
                         _resolved_map[p] = p if p.startswith("+") else f"+{p}"
 
@@ -808,6 +811,22 @@ class ServiceManager:
 
                     except Exception as e:
                         err_lower = str(e).lower()
+
+                        # ── PEER_ID_INVALID: Phone number not on Telegram ────────
+                        if "peer_id_invalid" in err_lower:
+                            logger.warning("❌ PEER_ID_INVALID for %s - number not on Telegram or contact not added", target)
+                            # Mark as failed and skip retries
+                            job["failed"] += 1
+                            async with async_session() as db:
+                                db.add(FailedMessage(
+                                    campaign_id=campaign_id,
+                                    account_id=acc.id if acc else None,
+                                    target=target,
+                                    message_text=text,
+                                    error="PEER_ID_INVALID - Number not on Telegram or contact not added",
+                                ))
+                                await db.commit()
+                            break  # Skip retries for this target
 
                         # ── FloodWait: block this account, try another ────────
                         if "flood" in err_lower:
@@ -1176,42 +1195,34 @@ class ServiceManager:
     # ── Stats ─────────────────────────────────────────────────────────────────
 
     async def get_stats(self) -> dict:
+        # FIX: SQLAlchemy async sessions do NOT support concurrent queries
+        # on the same session (asyncio.gather with same db = crash).
+        # Use ONE session, run queries SEQUENTIALLY — still fast for SQLite.
         async with async_session() as db:
-            # Run all counts in parallel using asyncio.gather
-            import asyncio as _aio
-
-            (total_accounts, active_accounts, total_sent,
-             total_campaigns, total_proxies, total_templates) = await _aio.gather(
-                db.scalar(select(func.count(Account.id))),
-                db.scalar(select(func.count(Account.id)).where(Account.is_active == True)),
-                db.scalar(select(func.sum(Account.messages_sent))),
-                db.scalar(select(func.count(Campaign.id))),
-                db.scalar(select(func.count(Proxy.id))),
-                db.scalar(select(func.count(MessageTemplate.id))),
-            )
-            total_accounts  = total_accounts  or 0
-            active_accounts = active_accounts or 0
-            total_sent      = total_sent      or 0
-            total_campaigns = total_campaigns or 0
-            total_proxies   = total_proxies   or 0
-            total_templates = total_templates or 0
+            total_accounts  = (await db.scalar(select(func.count(Account.id)))) or 0
+            active_accounts = (await db.scalar(
+                select(func.count(Account.id)).where(Account.is_active == True))) or 0
+            total_sent      = (await db.scalar(select(func.sum(Account.messages_sent)))) or 0
+            total_campaigns = (await db.scalar(select(func.count(Campaign.id)))) or 0
+            total_proxies   = (await db.scalar(select(func.count(Proxy.id)))) or 0
+            total_templates = (await db.scalar(select(func.count(MessageTemplate.id)))) or 0
 
             camp_result = await db.execute(
-                select(Campaign.status, func.count(Campaign.id)).group_by(Campaign.status))
+                select(Campaign.status, func.count(Campaign.id))
+                .group_by(Campaign.status))
             campaign_by_status = {s: c for s, c in camp_result.all()}
 
-            # Per-account + recent logs in one round
-            accs_res, logs_res = await _aio.gather(
-                db.execute(select(Account.id, Account.name, Account.phone,
-                                  Account.messages_sent)
-                           .order_by(Account.created_at.desc())),
-                db.execute(select(Log).order_by(Log.created_at.desc()).limit(50)),
-            )
+            accs_res = await db.execute(
+                select(Account.id, Account.name, Account.phone, Account.messages_sent)
+                .order_by(Account.created_at.desc()))
             per_account = [
                 {"id": r.id, "name": r.name or r.phone,
                  "phone": r.phone, "sent": r.messages_sent or 0, "failed": 0}
                 for r in accs_res.all()
             ]
+
+            logs_res = await db.execute(
+                select(Log).order_by(Log.created_at.desc()).limit(50))
             recent_logs = [
                 {"id": l.id, "category": l.category or "general",
                  "level": l.level or "info", "message": l.message or "",
@@ -1219,19 +1230,21 @@ class ServiceManager:
                 for l in logs_res.scalars().all()
             ]
 
-            success_rate = "100%" if total_sent > 0 else "0%"
+        success_rate = (
+            f"{total_sent / max(total_sent, 1) * 100:.0f}%"
+            if total_sent > 0 else "0%")
 
-            return {
-                "accounts": {"total": total_accounts, "active": active_accounts},
-                "messages": {"sent": total_sent, "failed": 0, "total": total_sent},
-                "success_rate": success_rate,
-                "campaigns": {"total": total_campaigns, "by_status": campaign_by_status},
-                "proxies": total_proxies,
-                "templates": total_templates,
-                "scrape_ops": 0,
-                "per_account": per_account,
-                "recent_logs": recent_logs,
-            }
+        return {
+            "accounts": {"total": total_accounts, "active": active_accounts},
+            "messages": {"sent": total_sent, "failed": 0, "total": total_sent},
+            "success_rate": success_rate,
+            "campaigns": {"total": total_campaigns, "by_status": campaign_by_status},
+            "proxies":   total_proxies,
+            "templates": total_templates,
+            "scrape_ops": 0,
+            "per_account": per_account,
+            "recent_logs": recent_logs,
+        }
 
     # ── Logs ──────────────────────────────────────────────────────────────────
 

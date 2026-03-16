@@ -254,17 +254,38 @@ class LoginDialog(QDialog):
         self.phone = phone
         self.selected_proxy_id = self.proxy_combo.currentData()
         self.set_loading(True)
+        self.clear_error()
 
-        try:
-            # FIX: was self.api.post(Endpoints.LOGIN_START, {...})
-            response = self.data.login_start(phone, self.selected_proxy_id)
-            self.phone_code_hash = response.get("phone_code_hash", "")
-            self.set_loading(False)
-            self.show_code_step()
-            toast_info("Code sent! Check your Telegram app.")
-        except Exception as exc:
-            self.set_loading(False)
-            self.show_error(str(exc) or "Failed to send code")
+        # Run in background thread — prevents UI freeze during Telegram connect
+        from PyQt6.QtCore import QThread, pyqtSignal as _sig
+
+        class _LoginThread(QThread):
+            done = _sig(dict)
+            error = _sig(str)
+            def __init__(self, data, phone, proxy_id):
+                super().__init__()
+                self._data = data; self._phone = phone; self._pid = proxy_id
+            def run(self):
+                try:
+                    r = self._data.login_start(self._phone, self._pid)
+                    self.done.emit(r)
+                except Exception as e:
+                    self.error.emit(str(e))
+
+        self._login_thread = _LoginThread(self.data, phone, self.selected_proxy_id)
+        self._login_thread.done.connect(self._on_code_sent)
+        self._login_thread.error.connect(self._on_login_error)
+        self._login_thread.start()
+
+    def _on_code_sent(self, response: dict):
+        self.phone_code_hash = response.get("phone_code_hash", "")
+        self.set_loading(False)
+        self.show_code_step()
+        toast_info("Code sent! Check your Telegram app.")
+
+    def _on_login_error(self, error: str):
+        self.set_loading(False)
+        self.show_error(error or "Failed to send code")
 
     def _complete_login(self):
         code = ''
